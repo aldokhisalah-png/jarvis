@@ -55,7 +55,7 @@ There are no built-in rules about when you study, eat, train or sleep. Those com
 ## Setting it up
 1. Run `supabase/migrations/20261005_jarvis.sql`, then `supabase/seed-memory.sql`.
 2. Supabase → Edge Functions → Secrets: `ANTHROPIC_API_KEY` (required), `GOOGLE_MAPS_API_KEY` (live traffic; optional), `AI_MODEL` (optional, default `claude-sonnet-5-5`).
-3. `scripts/sync-function.sh`, commit and push, then deploy the `jarvis` function with JWT verification off. The deployed `index.ts` is one line that imports `supabase/functions/jarvis/index.ts` from this repo at a fixed commit id — to ship a backend change, push it and redeploy that line with the new commit id. Deploy (it checks sign-in itself; the existing `jarvis-push` cron job calls it every minute).
+3. `scripts/sync-function.sh`, commit and push, then deploy the `jarvis` function with JWT verification off. The deployed `index.ts` is one line that imports `supabase/functions/jarvis/index.ts` from this repo at a fixed commit id — to ship a backend change, push it and redeploy that line with the new commit id. JWT verification is off because the function checks sign-in itself and the existing `jarvis-push` cron job calls it every minute.
 4. Push this folder to `aldokhisalah-png/jarvis` and turn on GitHub Pages.
 5. In the app: set home, uni and gym under You → Places, and turn on notifications.
 
