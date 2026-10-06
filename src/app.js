@@ -110,8 +110,11 @@ async function weeklyReport() {
 const scrollThread = () => { if (st.tab === 'ask') setTimeout(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }), 40); };
 
 // ------------------------------------------------------------------ location
+// Only his phone reports where he is — it's the device that travels with him. A laptop's position is often
+// a guess from Wi-Fi, or it's sitting at home while he's out, so on a laptop Jarvis goes by where the plan has him.
+const ON_PHONE = /iPhone|iPod|Android.*Mobile/i.test(navigator.userAgent);
 function locate() {
-  if (!('geolocation' in navigator)) return;
+  if (!ON_PHONE || !('geolocation' in navigator)) return;
   navigator.geolocation.getCurrentPosition(p => { st.coords = { lat: +p.coords.latitude.toFixed(6), lng: +p.coords.longitude.toFixed(6) }; updateEta(); }, () => { }, { maximumAge: 120000, timeout: 15000 });
 }
 async function updateEta() {
