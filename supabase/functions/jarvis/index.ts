@@ -66,14 +66,19 @@ async function aiJson({ system, turns, schema, task }: any) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, max_tokens: task === 'plan' ? 12000 : 6000, system, messages: turns,
-      tools: [{ name: 'answer', description: 'Give your answer in this shape.', input_schema: schema }], tool_choice: { type: 'tool', name: 'answer' } })
+    // Newer models don't allow forcing a tool, so the tool is offered and the system prompt says to answer with it;
+    // if a reply ever comes back as text instead, the JSON in it is used.
+    body: JSON.stringify({ model: MODEL, max_tokens: task === 'plan' ? 16000 : 8000,
+      system: `${system}\n\nAlways give your final answer by calling the "answer" tool exactly once, with every required field. Do not answer in plain text.`,
+      messages: turns, tools: [{ name: 'answer', description: 'Give your final answer in this shape.', input_schema: schema }], tool_choice: { type: 'auto' } })
   });
   const j = await r.json();
   if (!r.ok) throw new Error(`Claude request failed (${r.status}): ${j?.error?.message || 'unknown error'}`);
-  const call = (j.content || []).find((c: any) => c.type === 'tool_use');
-  if (!call) throw new Error('Claude gave no answer.');
-  return call.input;
+  const call = (j.content || []).find((c: any) => c.type === 'tool_use' && c.name === 'answer');
+  if (call) return call.input;
+  const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'), a = text.indexOf('{'), b = text.lastIndexOf('}');
+  if (a >= 0 && b > a) { try { return JSON.parse(text.slice(a, b + 1)); } catch { /* fall through */ } }
+  throw new Error(j.stop_reason === 'max_tokens' ? 'Claude ran out of room before finishing — try again.' : 'Claude gave no answer.');
 }
 
 // ---------------------------------------------------------------- his data (read his apps, write only Jarvis's tables)
