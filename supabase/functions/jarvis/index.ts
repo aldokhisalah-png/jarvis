@@ -261,7 +261,7 @@ async function resolveLink(url: any) {
   if (!/^https?:\/\//i.test(u)) throw new Error('Paste a Google Maps link, or coordinates like 29.31, 47.98.');
   const googleHost = (h: string) => /(^|\.)google\.[a-z.]+$/.test(h) || /(^|\.)goo\.gl$/.test(h);
   const parse = (s: string) => {
-    const t = decodeURIComponent(s);
+    let t = s; try { t = decodeURIComponent(s); } catch { /* a page or link with a stray % — read it as it is */ }
     const m = t.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/) || t.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/) || t.match(/[?&](?:q|query|ll|center|destination)=(-?\d+\.\d+),\s*(-?\d+\.\d+)/);
     if (!m) return null;
     const name = t.match(/\/place\/([^/@?]+)/);
