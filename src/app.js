@@ -4,14 +4,14 @@
 // preview: the same core running in the page). This file only shows it and sends what Salah does.
 // =====================================================================
 import { buildQuestions, answersToChanges, SECTIONS, answered } from './questionnaire.js';
-import { toMin, planMin, t12, addDays, dayDiff, dowOf, DAYS, MON, appOf, localOf, FOODS, baseDay, DINNER_WEEK, mealOf, makesOf, tookOf, PLACES, PLACE_NAME, isGym } from './engine.js';
+import { dayNow, toMin, planMin, t12, addDays, dayDiff, dowOf, DAYS, MON, appOf, localOf, FOODS, baseDay, DINNER_WEEK, mealOf, makesOf, tookOf, PLACES, PLACE_NAME, isGym } from './engine.js';
 
 let B = null;                     // the backend adapter
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const here = () => localOf(new Date().toISOString(), 180);              // Kuwait time, whatever the device says
+const here = () => dayNow(new Date().toISOString(), 180);               // Kuwait time, whatever the device says; until 3am it's still last night
 const today = () => here().date;
-const nowM = () => { const n = here().min; return n < 180 ? n + 1440 : n; };
+const nowM = () => here().min;
 const longDate = d => `${DAYS[dowOf(d)]} ${+d.slice(8)} ${['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][+d.slice(5, 7) - 1]}`;
 const relDay = d => { const n = dayDiff(today(), d); return n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : n === -1 ? 'Yesterday' : DAYS[dowOf(d)]; };
 const T = hhmm => hhmm ? t12(toMin(hhmm)) : '';

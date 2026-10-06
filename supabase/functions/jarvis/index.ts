@@ -39,7 +39,7 @@ const TZ = 180;                                         // Kuwait, no daylight s
 const MONTHLY_CAP = 4500;                               // Google Routes: free up to 5,000 a month per endpoint
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type', 'Access-Control-Allow-Methods': 'POST, OPTIONS' };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json' } });
-const localNow = () => E.localOf(new Date().toISOString(), TZ);
+const localNow = () => E.dayNow(new Date().toISOString(), TZ);   // until 03:00 it's still last night: yesterday's date, past 24:00
 const clock = { today: () => localNow().date, nowMin: () => localNow().min };
 
 function serverKey() {

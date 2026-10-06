@@ -40,7 +40,7 @@ function createJarvis({ db, ai, places, clock, planBudgetMs = Infinity }) {
     const restDays = ((d.settings.prefs || {}).restDays) || [];
     const pv = d.nutrition.planVersions.slice().sort((a, b) => (a.version || 0) - (b.version || 0)).pop() || null;
     return { ...d, marks: d.marks || [], today: t, sessionMinutes: real, restDays, planVersion: pv,
-      gymState: { lastCompleted: d.ppl.lastCompleted, lastSessionDate: lastSession ? E.localOf(lastSession.date, 180).date : null, lastSessionDay: lastSession ? lastSession.day : null, restDays } };
+      gymState: { lastCompleted: d.ppl.lastCompleted, lastSessionDate: lastSession ? E.dayNow(lastSession.date, 180).date : null, lastSessionDay: lastSession ? lastSession.day : null, restDays } };
   }
 
   /** Minutes of study already planned (and not skipped) for each deadline, in days before `date`. */

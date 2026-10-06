@@ -327,4 +327,12 @@ ok(E.validatePlan(dayP, { ...MONDAY, blocks: MONDAY.blocks.map(b => b.type === '
 
 console.log('21 · his apps were only read');
 ok(JSON.stringify(db.state.pplRows) === JSON.stringify(SAMPLE.pplRows) && JSON.stringify(db.state.nutritionRows) === JSON.stringify(SAMPLE.nutritionRows) && JSON.stringify(db.state.events) === JSON.stringify(SAMPLE.events), 'PPL Coach, Nutrition Coach and Uni Planner data unchanged');
+console.log('22 · after midnight it is still last night');
+{ const a = E.dayNow('2026-10-06T21:35:00Z'), b = E.dayNow('2026-10-07T00:10:00Z'), c = E.dayNow('2026-10-06T18:00:00Z');
+  ok(a.date === '2026-10-06' && a.min === 24 * 60 + 35, '00:35 on the 7th is 24:35 of the 6th — he hasn\'t slept yet');
+  ok(b.date === '2026-10-07' && b.min === 3 * 60 + 10 && c.date === '2026-10-06' && c.min === 21 * 60, 'from 3am it\'s the new day; evenings are unchanged'); }
+{ const late = { ...monDay, start: 24 * 60 + 35, startLoc: 'gym_rigae' };
+  const tonight = { summary: 'Home and to bed.', notes: [], blocks: [B('00:40', '00:55', 'travel', 'Drive home', { from: 'gym_rigae', to: 'home', reason: 'r' }), B('01:00', '09:00', 'sleep', 'Lights out', { loc: 'home', reason: 'r' })] };
+  const v = E.validatePlan(late, tonight);
+  ok(!v.errors.some(e => /no gym session|wake/i.test(e)), 'at 00:35 a plan of "drive home, lights out" needs no gym and no wake block: ' + v.errors.join(' ')); }
 console.log('\ncore test passed');

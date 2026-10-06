@@ -25,6 +25,9 @@ const dlong = d => `${DAYS[dowOf(d)].slice(0, 3)} ${+d.slice(8)} ${MON[+d.slice(
 function localOf(ts, tz = 180) { const d = new Date(Date.parse(ts) + tz * 60000); return { date: d.toISOString().slice(0, 10), min: d.getUTCHours() * 60 + d.getUTCMinutes() }; }
 const AFTER_MIDNIGHT = 180;                  // a plan time before 03:00 is after midnight (e.g. lights out at 00:30)
 const planMin = s => { const m = toMin(s); return m == null ? null : m < AFTER_MIDNIGHT ? m + 1440 : m; };
+/** His day, not the calendar's: until 03:00 he's still in yesterday (it's 00:35 of last night, not the start of today),
+ *  so the date is yesterday's and the time runs past 24:00. Today's plan starts fresh from 03:00. */
+function dayNow(ts, tz = 180) { const l = localOf(ts, tz); return l.min < AFTER_MIDNIGHT ? { date: addDays(l.date, -1), min: l.min + 1440 } : l; }
 const round1 = x => Math.round(x * 10) / 10;
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
@@ -550,6 +553,7 @@ function dayFacts(day) {
     date: day.date, weekday: day.dayName,
     planFrom: day.start == null ? 'the whole day, from when he wakes up' : `${fmt(day.start)} (it is now ${fmt(day.nowMin)} — plan the rest of the day only)`,
     startsAt: day.startLoc,
+    ...(day.start != null && day.start >= 1440 ? { lateNight: `It's ${fmt(day.start)} — past midnight, and he hasn't slept yet. Plan only the rest of tonight: if he isn't home, the drive home first; then lights out as soon as is sensible (a short wind-down at most). The sleep block runs until the time he should get up for tomorrow (classes, his usual wake time). Tomorrow gets its own plan — don't plan it here.` } : {}),
     classesAndExams: live.map(f => ({ start: fmt(f.start), end: fmt(f.end), title: f.title, room: f.room, ...(f.graded.length ? { gradedInClass: f.graded } : {}), ...(f.lengthGuessed ? { note: 'length not in Uni Planner — 2 h assumed' } : {}) })),
     missedClasses: day.fixed.filter(f => f.missed).map(f => `${f.title} ${fmt(f.start)}–${fmt(f.end)} — already started and he isn't at uni`),
     noClassesToday: live.length === 0 && !day.fixed.some(f => f.missed),
@@ -762,7 +766,7 @@ function validatePlan(day, raw) {
   if (ov.wake && day.start == null && wake && Math.abs(wake.s - toMin(ov.wake)) > 10) errors.push(`He said he's up at ${ov.wake} that day, but wake is at ${wake.start}.`);
   // the gym is every day; only a rest day he picks is a day off
   const saysWhy = [...((raw && raw.rulesNotMet) || [])].some(r => /gym|train/i.test(String(r)));
-  if (!gym && !day.gym.done && !day.gym.chosenRest && !saysWhy) errors.push(`There's no gym session. He trains every day (${DAY_NAMES[day.gym.workout]} is next) and only rests on days he picks himself — fit it in, shorter if it must be. If it truly can't fit, say why in rulesNotMet and give him options in choices (a shorter session, another time, a different branch, or making today a rest day).`);
+  if (!gym && !day.gym.done && !day.gym.chosenRest && !saysWhy && !(day.start != null && day.start >= 1440)) errors.push(`There's no gym session. He trains every day (${DAY_NAMES[day.gym.workout]} is next) and only rests on days he picks himself — fit it in, shorter if it must be. If it truly can't fit, say why in rulesNotMet and give him options in choices (a shorter session, another time, a different branch, or making today a rest day).`);
   // worth a look, not wrong
   if (gym && day.gym.minutes && gym.e - gym.s < day.gym.minutes * 0.75) warnings.push(`The gym block is ${gym.e - gym.s} min; ${DAY_NAMES[day.gym.workout]} usually takes about ${day.gym.minutes}.`);
   return { ok: errors.length === 0, errors: [...new Set(errors)], warnings, plan };
@@ -883,7 +887,7 @@ export {
   toMin, fmt, t12, addDays, dayDiff, dowOf, DAYS, MON, dlong, localOf, planMin, clamp,
   ROTATION, DAY_NAMES, PROGRAM, EX_BY_ID, CATS, BACKOFF, nextDay, planSet1, pplEstimateMinutes, gymFor,
   FOODS, BASE_MEALS, SUPPLEMENTS, DINNER_WEEK, DAY_TYPE_LABEL, baseDay, macrosOf, mealsForDay, targetsOf, NUTRITION_RULES,
-  KIND_NAME, GRADED, PLACES, PLACE_NAME, isGym, isHome, makeDrive, interp, gymCrowds,
+  dayNow, KIND_NAME, GRADED, PLACES, PLACE_NAME, isGym, isHome, makeDrive, interp, gymCrowds,
   OVERRIDE_TIMES, cleanOverrides, memoryFor, buildDay, dayFacts, driveTable,
   BLOCK_TYPES, appOf, readPlan, validatePlan, isBackground, planDiff, shiftForTraffic, routeOverruns, marginFor, PRIORITY_GROUPS,
   gymStats, nutritionStats, uniStats, scheduleStats,
