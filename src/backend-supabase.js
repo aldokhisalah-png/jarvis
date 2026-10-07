@@ -50,13 +50,18 @@ function supabaseBackend(cfg) {
       const s = { supported: 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window, subscribed: false, perm: 'default' };
       if (!s.supported) return s;
       s.perm = Notification.permission;
-      try { const reg = await navigator.serviceWorker.getRegistration(); const sub = reg && await reg.pushManager.getSubscription(); s.subscribed = !!sub; } catch { }
+      try {
+        const reg = await navigator.serviceWorker.getRegistration(); const sub = reg && await reg.pushManager.getSubscription(); s.subscribed = !!sub;
+        // the phone has a subscription: make sure Jarvis's server has it too (a save that failed once would otherwise mean silence forever)
+        if (sub && uid && s.perm === 'granted') { const j = sub.toJSON(); await sb.from('jarvis_push_subs').upsert({ endpoint: j.endpoint, user_id: uid, p256dh: j.keys.p256dh, auth: j.keys.auth, device: navigator.userAgent.slice(0, 120) }, { onConflict: 'endpoint' }); }
+      } catch { }
       return s;
     },
     async pushOn() {
       const perm = await Notification.requestPermission();
       if (perm !== 'granted') throw new Error('Notifications weren’t allowed.');
-      const reg = await navigator.serviceWorker.ready;
+      if (!(await navigator.serviceWorker.getRegistration())) await navigator.serviceWorker.register('sw.js');
+      const reg = await Promise.race([navigator.serviceWorker.ready, new Promise((_, no) => setTimeout(() => no(new Error('Jarvis’s background worker isn’t running yet — close Jarvis fully, reopen it from your home screen and try again.')), 12000))]);
       let sub = await reg.pushManager.getSubscription();
       if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToU8(cfg.vapidPublicKey) });
       const j = sub.toJSON();

@@ -235,7 +235,7 @@ function viewToday() {
       <button class="btn pri" data-act="make">${isToday ? 'Plan my day' : 'Plan this day now'}</button></section>`;
   }
   const n = isToday ? nowM() : null;
-  return h + `<div class="today-grid"><div class="col-hero">${hero(p, n)}</div><div class="col-side">${checkIn(p, n)}${notes(p)}${foresight(p)}${checks(p)}</div>
+  return h + `<div class="today-grid"><div class="col-hero">${hero(p, n)}</div><div class="col-side">${pushNudge()}${checkIn(p, n)}${notes(p)}${foresight(p)}${checks(p)}</div>
     <div class="col-plan">${timeline(p, n)}<div class="made">Planned by Jarvis${made ? ` ${relDay(made.date).toLowerCase()} at ${t12(made.min)}` : ''} · <button class="link" data-act="replan">${isToday ? 'Re-plan from now' : 'Re-plan this day'}</button></div></div></div>`;
 }
 function thinking() {
@@ -334,6 +334,14 @@ function checks(p) {
 const ASKABLE = ['cook', 'meal', 'study', 'homework', 'gym', 'other'];
 /** Past blocks he never marked. Jarvis doesn't assume they happened — it asks. */
 const unmarked = (p, n) => n == null ? [] : blocks(p).filter(b => ASKABLE.includes(b.type) && b.e <= n && !b.done && !b.skipped);
+/** Until notifications are on for this phone, Today says so — Jarvis can't tell you when to leave otherwise. */
+function pushNudge() {
+  const P = st.push; if (B.mode !== 'live' || !P || P.subscribed) return '';
+  const why = 'I can’t tell you when to leave, when to cook or what tomorrow looks like until notifications are on for this phone.';
+  if (!P.supported) return `<section class="card note alert"><span class="eb">Notifications are off</span><p>${why} On iPhone they only work in the installed app: Share → Add to Home Screen, then open Jarvis from the home screen.</p></section>`;
+  if (P.perm === 'denied') return `<section class="card note alert"><span class="eb">Notifications are blocked</span><p>${why} Turn them on in Settings → Notifications → Jarvis.</p></section>`;
+  return `<section class="card note alert"><span class="eb">Notifications are off</span><p>${why}</p><div class="acts"><button class="btn sm pri" data-act="push-on">Turn on notifications</button></div></section>`;
+}
 function checkIn(p, n) {
   const list = unmarked(p, n); if (!list.length) return '';
   return `<section class="card checks"><div class="ch"><span class="eb">Did these happen?</span><span class="eb warn">${list.length} not marked</span></div>
@@ -837,7 +845,11 @@ document.addEventListener('click', async e => {
       err => toast(err.code === 1 ? 'Location is blocked — allow it for Jarvis in your phone settings.' : 'Couldn’t get your location.'), { enableHighAccuracy: true, timeout: 20000 });
     return;
   }
-  if (act === 'push-on') { try { await B.pushOn(); st.push = await B.pushStatus(); toast('Notifications are on for this phone.'); } catch (err) { toast(err.message, 6000); } refreshSheet(); return; }
+  if (act === 'push-on') {
+    try { toast('Turning on notifications…'); await B.pushOn(); st.push = await B.pushStatus(); const r = await B.call('test-push', {}); toast(r.error ? `On, but the test didn’t send: ${r.error}` : 'Notifications are on — a test is on its way.', 6000); }
+    catch (err) { toast(err.message, 8000); }
+    if ($('#sheet').open) refreshSheet(); else render(); return;
+  }
   if (act === 'push-off') { try { await B.pushOff(); st.push = await B.pushStatus(); toast('Notifications are off for this phone.'); } catch (err) { toast(err.message); } refreshSheet(); return; }
   if (act === 'push-test') { try { const r = await B.call('test-push', {}); toast(r.error || `Sent to ${r.delivered} of ${r.devices} device${r.devices > 1 ? 's' : ''}.`); } catch (err) { toast(err.message, 6000); } return; }
   if (act === 'signout') { $('#sheet').close(); await B.signOut(); return; }
