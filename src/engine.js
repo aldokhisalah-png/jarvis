@@ -184,7 +184,7 @@ function cookedAhead(date, plans, today) {
   for (const p of plans.filter(p => p.date < date && dayDiff(p.date, date) <= KEEPS_DAYS)) for (const b of (p.plan && p.plan.blocks) || []) {
     if (b.type !== 'cook' || b.skipped) continue;
     for (const m of makesOf(b, p.date).filter(m => m.date === date))
-      out.push({ meal: m.meal, cookedOn: `${shortDay(p.date)} ${b.start}`, status: b.done || tookOf(b) != null ? 'cooked (he marked it done)' : p.date < today ? 'planned, but he never marked it done' : 'planned, not cooked yet' });
+      out.push({ meal: m.meal, cookedOn: `${shortDay(p.date)} ${b.start}`, status: b.done || tookOf(b) != null ? 'cooked (he marked it done)' : p.date < today ? 'planned, but he never marked it done — don\'t count on it: plan it as not cooked and ask him' : 'planned, not cooked yet' });
   }
   return out;
 }
@@ -590,7 +590,7 @@ function dayFacts(day) {
     ...(day.travel.maidHours ? { maidHours: `${day.travel.maidHours.from}–${day.travel.maidHours.to}` } : {}),
     ...(day.goals ? { whatHeIsWorkingToward: compactTree(day.goals) } : { hisGoals: day.memory.goals.map(g => g.text), hisHabits: day.memory.habits.map(h => ({ strength: h.strength, habit: h.text })), hisRules: day.memory.rules.map(r => ({ strength: r.strength, rule: r.text })) }),
     changesForThisDay: day.memory.today.map(m => ({ said: m.text, ...(Object.keys(m.overrides).length ? { mustKeep: m.overrides } : {}) })),
-    ...(day.earlier ? { earlierToday: day.earlier.blocks, ...(day.earlier.inProgress.length ? { inProgressNow: day.earlier.inProgress } : {}) } : {}),
+    ...(day.earlier ? { earlierToday: day.earlier.blocks, ...(day.earlier.eatenToday && day.earlier.eatenToday.length ? { mealsLoggedInNutritionCoachToday: day.earlier.eatenToday } : {}), ...(day.earlier.inProgress.length ? { inProgressNow: day.earlier.inProgress } : {}) } : {}),
     nextDays: day.nextDays,
     ...(day.history ? { howHisRecentDaysWent: day.history } : {}),
     ...(day.liveDrive ? { liveTrafficNow: `The drive to ${day.liveDrive.to} takes ${day.liveDrive.minutes} min right now${day.liveDrive.to === 'uni' ? ', parking included' : ''} — use at least that, not the forecast.` } : {})
@@ -722,7 +722,7 @@ function validatePlan(day, raw) {
   // food: cook it before eating it (today, earlier today, or ahead); cooked food keeps 3 days; he can't eat what he's out of
   if (day.food) {
     const outOf = new Set(day.kitchen.pantry.outOf.filter(o => o.status === 'out').map(o => o.food));
-    const cooked = new Map([...(day.earlier ? day.earlier.madeToday : []), ...day.kitchen.alreadyCooked.map(a => a.meal)].map(m => [m, -1])), bought = new Set();
+    const cooked = new Map([...(day.earlier ? day.earlier.madeToday : []), ...day.kitchen.alreadyCooked.filter(a => !/never marked/.test(a.status)).map(a => a.meal)].map(m => [m, -1])), bought = new Set();
     for (const b of ALL) {
       if (Array.isArray(b.shop)) for (const f of b.shop) bought.add(f);
       if (b.type === 'cook') {

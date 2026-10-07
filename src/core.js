@@ -43,11 +43,13 @@ function createJarvis({ db, ai, places, clock, planBudgetMs = Infinity }) {
       gymState: { lastCompleted: d.ppl.lastCompleted, lastSessionDate: lastSession ? E.dayNow(lastSession.date, 180).date : null, lastSessionDay: lastSession ? lastSession.day : null, restDays } };
   }
 
-  /** Minutes of study already planned (and not skipped) for each deadline, in days before `date`. */
+  /** Minutes of study for each deadline in days before `date`: on days already over, only what he marked done;
+   *  on today and days still ahead, what's planned (and not skipped). A block he never marked didn't happen as far as Jarvis knows. */
   function priorWork(plans, date) {
-    const out = {};
+    const out = {}, now = clock.today();
     for (const p of plans.filter(p => p.date < date)) for (const b of (p.plan && p.plan.blocks) || []) {
       if (!b.ref || b.skipped || !['study', 'homework'].includes(b.type)) continue;
+      if (p.date < now && !b.done && E.tookOf(b) == null) continue;
       out[b.ref] = (out[b.ref] || 0) + Math.max(0, (E.planMin(b.end) || 0) - (E.planMin(b.start) || 0));
     }
     return out;
@@ -67,15 +69,22 @@ function createJarvis({ db, ai, places, clock, planBudgetMs = Infinity }) {
   const dayInput = (d, date) => ({ date, today: d.today, classes: d.classes, events: d.events, plannerSettings: d.plannerSettings, gym: d.gymState, sessionMinutes: d.sessionMinutes,
     nutrition: { profile: d.nutrition.profile, planVersion: d.planVersion }, memory: d.memory, priorWork: priorWork(d.plans, date) });
   const hhmm = iso => E.fmt(E.localOf(iso, 180).min);
-  const tapStatus = b => b.done ? (E.tookOf(b) ? `done, took ${E.tookOf(b)} min` : 'done') : b.skipped ? 'skipped' : b.startedAt ? `he started it at ${hhmm(b.startedAt)}` : 'not marked';
+  const tapStatus = (b, eaten = []) => b.done ? (E.tookOf(b) ? `done, took ${E.tookOf(b)} min` : 'done') : b.skipped ? 'skipped'
+    : b.type === 'meal' && eaten.includes(E.mealOf(b)) ? 'eaten (logged in Nutrition Coach)'
+    : b.startedAt ? `he started it at ${hhmm(b.startedAt)}, never marked done` : 'not marked — unknown whether it happened';
+  /** Meals he logged as eaten in Nutrition Coach on `date`. */
+  const mealsLogged = (d, date) => { const l = ((d && d.nutrition && d.nutrition.foodLogs) || []).find(x => x && x.date === date); return l ? Object.entries(l.meals || {}).filter(([, m]) => m && Array.isArray(m.actual) && m.actual.length).map(([k]) => k) : []; };
   /** What already happened today (from today's saved plan and his taps), when planning from now. */
-  function earlierToday(saved, now, date) {
+  function earlierToday(saved, now, date, eaten = []) {
     if (!saved || now == null) return null;
     const start = Math.ceil(now / 5) * 5, bl = E.readPlan(saved).blocks;
     const past = bl.filter(b => b.e <= start && b.type !== 'free');
+    const did = b => b.done || E.tookOf(b) != null;
     return {
-      blocks: past.map(b => `${b.start}–${b.end} ${b.type}: ${b.title}${b.type === 'cook' && E.makesOf(b, date).length ? ` (makes ${E.cookLabel(E.makesOf(b, date))})` : ''} — ${tapStatus(b)}`),
-      madeToday: past.filter(b => b.type === 'cook' && !b.skipped).flatMap(b => E.makesOf(b, date).filter(m => m.date === date).map(m => m.meal)),
+      blocks: past.map(b => `${b.start}–${b.end} ${b.type}: ${b.title}${b.type === 'cook' && E.makesOf(b, date).length ? ` (makes ${E.cookLabel(E.makesOf(b, date))})` : ''} — ${['travel', 'class', 'exam', 'wake', 'sleep'].includes(b.type) ? 'as planned, as far as Jarvis knows' : tapStatus(b, eaten)}`),
+      // cooked today only if he marked the cooking done, or he's already logged that meal as eaten
+      madeToday: [...new Set([...past.filter(b => b.type === 'cook' && did(b)).flatMap(b => E.makesOf(b, date).filter(m => m.date === date).map(m => m.meal)), ...eaten])],
+      eatenToday: eaten,
       inProgress: bl.filter(b => b.s < start && b.e > start && !['free', 'wake', 'sleep'].includes(b.type)).map(b => ({ what: `${b.type}: ${b.title}`, planned: `${b.start}–${b.end}`, he: tapStatus(b) }))
     };
   }
@@ -102,7 +111,7 @@ function createJarvis({ db, ai, places, clock, planBudgetMs = Infinity }) {
     const startLoc = isToday ? (where.startLoc || placeFromPlan(saved, now)) : 'home';
     const extra = context ? {
       kitchen: { cookTimes: E.cookTimes(d.plans, d.today), alreadyCooked: E.cookedAhead(date, d.plans, d.today), pantry: pantryOf(d, date) },
-      swaps: (saved && saved.swaps) || [], earlier: earlierToday(saved, now, date),
+      swaps: (saved && saved.swaps) || [], earlier: earlierToday(saved, now, date, isToday ? mealsLogged(d, date) : []),
       nextDays: [1, 2, 3].map(i => sketch(d, E.addDays(date, i))), history: E.howItWent(d.plans, d.today), goals: goalsOf(d),
       grocery: groceryFor(d, date)
     } : {};

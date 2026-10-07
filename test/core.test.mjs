@@ -162,6 +162,9 @@ const noCook = { ...MONDAY, blocks: MONDAY.blocks.filter(b => b.title !== 'Cook 
   ok(!E.validatePlan(monDay, { ...noGym, rulesNotMet: ['Gym: a 6-hour exam block and a 9pm bedtime leave no room — options below.'] }).errors.some(e => /no gym session/.test(e)), '…unless Jarvis says why the gym truly can\'t fit');
   ok(!E.validatePlan({ ...monDay, gym: { workout: 'rest', chosenRest: true } }, noGym).errors.some(e => /no gym session/.test(e)), '…and a rest day he picked needs no gym'); }
 ok(E.validatePlan(monDay, noCook).errors.some(e => /Dinner at 20:05 needs cooking \(Salmon, Sweet potato\)/.test(e)), 'dinner with nothing cooking it is rejected');
+{ const kit = st => ({ ...monDay, kitchen: { ...monDay.kitchen, alreadyCooked: [{ meal: 'dinner', cookedOn: 'Sun 20:00', status: st }] } });
+  ok(E.validatePlan(kit("planned, but he never marked it done — don't count on it"), noCook).errors.some(e => /Dinner at 20:05 needs cooking/.test(e)), 'cooking he never marked done doesn\'t count — Jarvis doesn\'t assume it happened');
+  ok(!E.validatePlan(kit('cooked (he marked it done)'), noCook).errors.some(e => /Dinner at 20:05 needs cooking/.test(e)), '…cooking he marked done does'); }
 const tooFar = { ...MONDAY, blocks: MONDAY.blocks.map(b => b.title === 'Cook dinner' ? { ...b, makes: [{ meal: 'dinner' }, { meal: 'lunch', date: '2026-10-10' }] } : b) };
 ok(E.validatePlan(monDay, tooFar).errors.some(e => /at most 3 days ahead/.test(e)), 'cooking 5 days ahead is rejected');
 const out = { ...monDay, kitchen: { ...monDay.kitchen, pantry: { ...monDay.kitchen.pantry, outOf: [{ food: 'eggs', name: 'Eggs', status: 'out', since: 'Mon 5 Oct' }] } } };

@@ -235,7 +235,7 @@ function viewToday() {
       <button class="btn pri" data-act="make">${isToday ? 'Plan my day' : 'Plan this day now'}</button></section>`;
   }
   const n = isToday ? nowM() : null;
-  return h + `<div class="today-grid"><div class="col-hero">${hero(p, n)}</div><div class="col-side">${notes(p)}${foresight(p)}${checks(p)}</div>
+  return h + `<div class="today-grid"><div class="col-hero">${hero(p, n)}</div><div class="col-side">${checkIn(p, n)}${notes(p)}${foresight(p)}${checks(p)}</div>
     <div class="col-plan">${timeline(p, n)}<div class="made">Planned by Jarvis${made ? ` ${relDay(made.date).toLowerCase()} at ${t12(made.min)}` : ''} · <button class="link" data-act="replan">${isToday ? 'Re-plan from now' : 'Re-plan this day'}</button></div></div></div>`;
 }
 function thinking() {
@@ -331,6 +331,16 @@ function checks(p) {
     ${c.ok.map(([a, t, d]) => `<div class="chk"><i style="--c:var(--${a})">✓</i><div><b>${esc(t)}</b><small>${esc(d)}</small></div></div>`).join('')}
     ${c.bad.map(r => `<div class="chk bad"><i>!</i><div><b>A rule I couldn’t keep</b><small>${esc(r)}</small></div></div>`).join('')}</section>`;
 }
+const ASKABLE = ['cook', 'meal', 'study', 'homework', 'gym', 'other'];
+/** Past blocks he never marked. Jarvis doesn't assume they happened — it asks. */
+const unmarked = (p, n) => n == null ? [] : blocks(p).filter(b => ASKABLE.includes(b.type) && b.e <= n && !b.done && !b.skipped);
+function checkIn(p, n) {
+  const list = unmarked(p, n); if (!list.length) return '';
+  return `<section class="card checks"><div class="ch"><span class="eb">Did these happen?</span><span class="eb warn">${list.length} not marked</span></div>
+    <p class="det" style="margin:2px 0 8px;font-size:14px;color:var(--ink-2)">I don’t count anything as done until you tell me — tap what you did, so the rest of the day is planned around what really happened.</p>
+    ${list.slice(0, 8).map(b => `<div class="chk"><i style="--c:var(--${appOf(b)})">?</i><div><b>${esc(b.title)}</b><small>${t12(b.s)}–${t12(b.e)}</small>
+      <span style="display:flex;gap:20px;margin-top:6px"><button class="link" data-act="mark" data-f="done" data-i="${b.i}">Done</button><button class="link quiet" data-act="mark" data-f="skipped" data-i="${b.i}">Didn’t</button></span></div></div>`).join('')}</section>`;
+}
 function notes(p) {
   const list = [];
   for (const m of st.memory.filter(m => m.kind === 'day' && m.date === st.date)) list.push({ k: 'change', eb: 'You said', html: esc(m.text), act: `<button class="link quiet" data-act="forget" data-id="${esc(m.id)}">Undo this change</button>` });
@@ -344,7 +354,8 @@ function timeline(p, n) {
   const past = n == null ? [] : bl.filter(b => b.e <= n - 20);
   const show = n == null || st.showEarlier ? bl : bl.filter(b => !past.includes(b));
   let h = `<section class="plan"><div class="ch"><span class="eb">The plan</span><span class="eb dim">${bl.length} blocks${bl.length ? ` · ${t12(bl[0].s)} – ${t12(bl[bl.length - 1].e)}` : ''}</span></div>`;
-  if (past.length && !st.showEarlier) h += `<button class="earlier" data-act="earlier"><i>✓</i><b>Earlier today · ${past.length}</b><span>${esc(past.filter(b => !['wake', 'free', 'travel'].includes(b.type)).slice(0, 3).map(b => b.title).join(' · '))}</span><em>Show</em></button>`;
+  const open = unmarked(p, n).length;
+  if (past.length && !st.showEarlier) h += `<button class="earlier" data-act="earlier"><i>${open ? '?' : '✓'}</i><b>Earlier today · ${past.length}${open ? ` · ${open} not marked` : ''}</b><span>${esc(past.filter(b => !['wake', 'free', 'travel'].includes(b.type)).slice(0, 3).map(b => b.title).join(' · '))}</span><em>Show</em></button>`;
   let nowDrawn = n == null, place = null, arrived = p.startLoc && PLACES.includes(p.startLoc) ? p.startLoc : 'home';
   h += `<ol class="day">`;
   for (const b of show) {
