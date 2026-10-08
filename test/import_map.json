@@ -1,1 +1,0 @@
-{ "imports": { "npm:@supabase/supabase-js@2": "./fake-supabase.ts" } }

@@ -1,46 +1,36 @@
-// jarvis — Salah's chief of staff, server side.
-// Jarvis READS Uni Planner, PPL Coach and Nutrition Coach (never writes to them). It plans his days with Claude,
-// talks with him and remembers what he says, analyses each app, writes a weekly report and sends notifications.
-// The thinking lives in core.js / brain.js / engine.js (the same files the app and the preview use).
+// jarvis — server side. Builds Salah's days from his rules (scheduler.js, no AI), and uses Claude only to:
+//   1. turn what he tells Jarvis into schedule changes ("no gym today", "I'm at my grandmother's 4–7"),
+//   2. double-check that each day is actually doable,
+//   3. decide what to do when live traffic breaks the plan.
+// Reads Uni Planner, PPL Coach and Nutrition Coach — never writes to them.
 //
-// Two ways in:
-//   • The app, with his login token — requests run AS him, so row-level security limits them to his rows.
-//   • pg_cron every minute with header x-cron-secret — notifications and scheduled work, using the server key;
-//     every query on that path is scoped to one user_id.
-// JWT verification is OFF at the gateway because the cron call has no user token; this file checks both itself.
+// In:
+//   • The app, with his login token (row-level security limits everything to his rows).
+//   • pg_cron every minute with x-cron-secret: notifications, live traffic, the nightly re-plan.
 //
-// Secrets: ANTHROPIC_API_KEY (required), GOOGLE_MAPS_API_KEY (traffic, optional), AI_MODEL (optional).
-// Push keys and the cron secret are shared with Uni Planner (table planner_private).
+// POST { action: 'plan', coords? }              → re-plan from now (where he is: live location, else his last check)
+// POST { action: 'tick', date, ref, done }      → check / uncheck a block, then re-plan the rest of today
+// POST { action: 'tell', message, coords? }     → Claude turns it into changes; re-plan; reply
+// POST { action: 'forget', id }                 → drop a change or note he told Jarvis
+// POST { action: 'place', key, url? , coords? } → set one of his places (Google Maps link or "I'm here")
+// POST { action: 'test-push' }
 //
-// POST { action: 'plan', date, nowMin?, coords?, request? } → Claude plans the day (saved); request = a change he picked
-// POST { action: 'solve', date, i?, problem?, missing? }    → options for something in the way (no time, missing food, gym won't fit…)
-// POST { action: 'choose', date, id, option }               → go with one option: the day is re-planned around it
-// POST { action: 'pantry', changes: [{food, status}] }     → what he's out of / has again
-// POST { action: 'kitchen' }                                → what Jarvis has learned: cook times, what's missing, recent days
-// POST { action: 'goals' }                                  → his big goals with progress, the habits and rules under them, marks
-// POST { action: 'mark', ref?, course?, title?, score, outOf } → a mark he got (Uni Planner has no scores)
-// POST { action: 'ask', date, message, nowMin?, coords? }  → Jarvis answers; may remember, forget, set a rest day, re-plan
-// POST { action: 'ahead' }                                  → the next 7 days (facts + saved plans)
-// POST { action: 'review', app? }                           → analyse one app, or all three (saved)
-// POST { action: 'report' }                                 → the weekly report (saved, and posted in the chat)
-// POST { action: 'eta', coords, to }                        → live drive minutes from where he is
-// POST { action: 'traffic', date, i, coords, to, nowMin }   → live drive no longer fits: shift the leave time or re-plan, and say what changed
-// POST { action: 'travel' }                                 → recompute drive times between his places
-// POST { action: 'resolve-link', url }                      → coordinates from a Google Maps link
-// POST { action: 'test-push' }                              → a test notification
+// Secrets: ANTHROPIC_API_KEY, GOOGLE_MAPS_API_KEY, AI_MODEL (optional). Push keys + cron secret: table planner_private.
 import { createClient } from 'npm:@supabase/supabase-js@2';
-import * as E from './engine.js';
-import { createJarvis, shapeApps } from './core.js';
+import * as Sched from './scheduler.js';
+const S: any = Sched;                                   // plain JS module
 import { sendPush } from './push.js';
 
 const env = (k: string) => Deno.env.get(k) ?? '';
 const MODEL = env('AI_MODEL') || 'claude-sonnet-5-5';
-const TZ = 180;                                         // Kuwait, no daylight saving
+const TZ = 180;
 const MONTHLY_CAP = 4500;                               // Google Routes: free up to 5,000 a month per endpoint
+const DAYS_AHEAD = 7;
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type', 'Access-Control-Allow-Methods': 'POST, OPTIONS' };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json' } });
-const localNow = () => E.dayNow(new Date().toISOString(), TZ);   // until 03:00 it's still last night: yesterday's date, past 24:00
-const clock = { today: () => localNow().date, nowMin: () => localNow().min };
+
+/** His day, not the calendar's: until 03:00 it's still last night (yesterday's date, minutes past 1440). */
+function localNow() { const l = S.localOf(new Date().toISOString(), TZ); return l.min < 180 ? { date: S.addDays(l.date, -1), min: l.min + 1440 } : l; }
 
 function serverKey() {
   if (env('SUPABASE_SERVICE_ROLE_KEY')) return env('SUPABASE_SERVICE_ROLE_KEY');
@@ -60,17 +50,15 @@ async function loadConfig() {
 }
 
 // ---------------------------------------------------------------- Claude
-async function aiJson({ system, turns, schema, task }: any) {
+async function aiJson({ system, user, schema, maxTokens = 3000 }: any) {
   const key = env('ANTHROPIC_API_KEY');
   if (!key) throw new Error('Jarvis needs ANTHROPIC_API_KEY in Supabase → Edge Functions → Secrets.');
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    // Newer models don't allow forcing a tool, so the tool is offered and the system prompt says to answer with it;
-    // if a reply ever comes back as text instead, the JSON in it is used.
-    body: JSON.stringify({ model: MODEL, max_tokens: task === 'plan' ? 16000 : 8000,
-      system: `${system}\n\nAlways give your final answer by calling the "answer" tool exactly once, with every required field. Do not answer in plain text.`,
-      messages: turns, tools: [{ name: 'answer', description: 'Give your final answer in this shape.', input_schema: schema }], tool_choice: { type: 'auto' } })
+    body: JSON.stringify({ model: MODEL, max_tokens: maxTokens,
+      system: `${system}\n\nAnswer by calling the "answer" tool exactly once.`,
+      messages: [{ role: 'user', content: user }], tools: [{ name: 'answer', description: 'Your answer.', input_schema: schema }], tool_choice: { type: 'auto' } })
   });
   const j = await r.json();
   if (!r.ok) throw new Error(`Claude request failed (${r.status}): ${j?.error?.message || 'unknown error'}`);
@@ -78,61 +66,55 @@ async function aiJson({ system, turns, schema, task }: any) {
   if (call) return call.input;
   const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'), a = text.indexOf('{'), b = text.lastIndexOf('}');
   if (a >= 0 && b > a) { try { return JSON.parse(text.slice(a, b + 1)); } catch { /* fall through */ } }
-  throw new Error(j.stop_reason === 'max_tokens' ? 'Claude ran out of room before finishing — try again.' : 'Claude gave no answer.');
+  throw new Error('Claude gave no answer.');
 }
 
-// ---------------------------------------------------------------- his data (read his apps, write only Jarvis's tables)
-function supabaseDb(sb: any, uid: string) {
-  const one = async (q: any) => { const { data, error } = await q; if (error) throw new Error(error.message); return data; };
-  return {
-    async load() {
-      const t = clock.today();
-      const [classes, events, ps, ppl, nut, settings, memory, plans, marks] = await Promise.all([
-        one(sb.from('planner_classes').select('course,kind,weekday,start_time,end_time,room,instructor').eq('user_id', uid)),
-        one(sb.from('planner_events').select('id,course,title,kind,due_at,all_day,weight,note,done,remind').eq('user_id', uid)
-          .gte('due_at', new Date(Date.now() - 40 * 864e5).toISOString()).lte('due_at', new Date(Date.now() + 75 * 864e5).toISOString())),
-        one(sb.from('planner_settings').select('*').eq('user_id', uid).maybeSingle()),
-        one(sb.from('ppl_records').select('kind,key,body').eq('user_id', uid)),
-        one(sb.from('nutrition_records').select('kind,id,body,deleted').eq('user_id', uid).eq('deleted', false).in('kind', ['profile', 'plan_version', 'measurement', 'food_log', 'weekly_review', 'phase_history', 'grocery_check'])),
-        one(sb.from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle()),
-        one(sb.from('jarvis_memory').select('id,kind,strength,text,serves,track,target,category,course,qid,date,overrides,active,created_at').eq('user_id', uid).eq('active', true).order('created_at')),
-        one(sb.from('day_plans').select('date,plan').eq('user_id', uid).gte('date', E.addDays(t, -42)).lte('date', E.addDays(t, 14)).order('date')),
-        one(sb.from('jarvis_marks').select('id,event_id,course,title,weight,score,out_of,created_at').eq('user_id', uid).order('created_at'))
-      ]);
-      const from = E.addDays(t, -1);
-      return { classes, events, plannerSettings: ps || {}, ...shapeApps({ pplRows: ppl, nutritionRows: nut }),
-        settings: settings || { places: {}, prefs: {}, travel: {} }, memory: (memory || []).filter((m: any) => m.kind !== 'day' || m.date >= from), plans: plans || [], marks: marks || [] };
-    },
-    async getPlan(date: string) { const r = await one(sb.from('day_plans').select('plan').eq('user_id', uid).eq('date', date).maybeSingle()); return r ? r.plan : null; },
-    async savePlan(date: string, plan: any) { await one(sb.from('day_plans').upsert({ user_id: uid, date, plan, source: 'ai', updated_at: new Date().toISOString() }, { onConflict: 'user_id,date' })); },
-    async deletePlans(dates: string[]) { if (dates.length) await one(sb.from('day_plans').delete().eq('user_id', uid).in('date', dates)); },
-    async insertMemory(row: any) { return await one(sb.from('jarvis_memory').insert({ user_id: uid, ...row }).select('id,kind,strength,text,serves,track,target,category,course,qid,date,overrides').single()); },
-    async insertMark(row: any) { return await one(sb.from('jarvis_marks').insert({ user_id: uid, ...row }).select('id,event_id,course,title,weight,score,out_of').single()); },
-    async deleteMemory(id: string) { const r = await one(sb.from('jarvis_memory').delete().eq('user_id', uid).eq('id', id).select('kind,text,date')); return r && r[0] || null; },
-    async saveSettings(patch: any) {
-      const cur = await one(sb.from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle()) || {};
-      await one(sb.from('day_settings').upsert({ user_id: uid, ...cur, ...patch, updated_at: new Date().toISOString() }, { onConflict: 'user_id' }));
-    },
-    async saveMessage(m: any) { await one(sb.from('jarvis_messages').insert({ user_id: uid, ...m })); },
-    async recentMessages(n: number) { const r = await one(sb.from('jarvis_messages').select('role,kind,body,created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(n)); return (r || []).reverse(); },
-    async saveReview(app: string, review: any, stats: any) { await one(sb.from('jarvis_reviews').insert({ user_id: uid, app, review, stats })); },
-    async latestReviews() {
-      const r = await one(sb.from('jarvis_reviews').select('app,review,created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(30));
-      const out: any = { ppl: null, nutrition: null, uni: null };
-      for (const x of r || []) if (!out[x.app]) out[x.app] = x.review;
-      return out;
-    },
-    async saveReport(row: any) { await one(sb.from('jarvis_reports').insert({ user_id: uid, source: 'ai', ...row })); },
-    async latestReport() { const r = await one(sb.from('jarvis_reports').select('report').eq('user_id', uid).order('created_at', { ascending: false }).limit(1)); return r && r[0] ? r[0].report : null; }
-  };
+// ---------------------------------------------------------------- data
+const one = async (q: any) => { const { data, error } = await q; if (error) throw new Error(error.message); return data; };
+async function loadAll(sb: any, uid: string, today: string) {
+  const [classes, events, ppl, nut, settings, memory, plans] = await Promise.all([
+    one(sb.from('planner_classes').select('course,kind,weekday,start_time,end_time,room').eq('user_id', uid)),
+    one(sb.from('planner_events').select('id,course,title,kind,due_at,all_day,weight,note,done').eq('user_id', uid)
+      .gte('due_at', new Date(Date.now() - 5 * 864e5).toISOString()).lte('due_at', new Date(Date.now() + 90 * 864e5).toISOString())),
+    one(sb.from('ppl_records').select('kind,key,body').eq('user_id', uid)),
+    one(sb.from('nutrition_records').select('kind,id,body').eq('user_id', uid).eq('deleted', false).eq('kind', 'plan_version')),
+    one(sb.from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle()),
+    one(sb.from('jarvis_memory').select('id,kind,text,date,overrides,category,created_at').eq('user_id', uid).eq('active', true).order('created_at')),
+    one(sb.from('day_plans').select('date,plan').eq('user_id', uid).gte('date', S.addDays(today, -14)).lte('date', S.addDays(today, DAYS_AHEAD + 1)).order('date'))
+  ]);
+  const st = settings || { places: {}, prefs: {}, travel: {} };
+  st.places = st.places || {}; st.prefs = st.prefs || {}; st.travel = st.travel || {};
+  return { classes: classes || [], events: events || [], ppl: S.pplFromRows(ppl || []), nutrition: S.nutritionFromRows(nut || []), settings: st,
+    dayChanges: (memory || []).filter((m: any) => m.kind === 'day' && m.date >= S.addDays(today, -1)),
+    notes: (memory || []).filter((m: any) => m.kind === 'rule' && m.category === 'standing'),
+    plans: (plans || []).filter((p: any) => p.plan && p.plan.version === 2) };
+}
+async function saveSettings(sb: any, uid: string, patch: any) {
+  const cur = await one(sb.from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle()) || {};
+  await one(sb.from('day_settings').upsert({ user_id: uid, ...cur, ...patch, updated_at: new Date().toISOString() }, { onConflict: 'user_id' }));
+}
+const savePlan = (sb: any, uid: string, date: string, plan: any) => one(sb.from('day_plans').upsert({ user_id: uid, date, plan, source: 'rules', updated_at: new Date().toISOString() }, { onConflict: 'user_id,date' }));
+
+/** Every change he told Jarvis for a date, merged in the order he said them. */
+function mergeChanges(rows: any[]) {
+  const out: Record<string, any> = {};
+  for (const r of rows) {
+    const c = r.overrides || {}, cur = out[r.date] = out[r.date] || {};
+    for (const [k, v] of Object.entries(c)) {
+      if (Array.isArray(v) && Array.isArray(cur[k])) cur[k] = [...cur[k], ...v];
+      else cur[k] = v;
+    }
+  }
+  return out;
 }
 
-// ---------------------------------------------------------------- drive times
+// ---------------------------------------------------------------- drive times (Google, cached)
+const KEY_PLACES = ['home', 'grandma', 'uni', 'gym', 'gym_rigae', 'gym_mahboula', 'gym_sabah'];   // same key as before, so cached traffic stays valid
 const month = () => localNow().date.slice(0, 7);
 function usage(settings: any) { const t = settings.travel = settings.travel || {}; if (!t.usage || t.usage.month !== month()) t.usage = { month: month(), matrix: 0, routes: 0 }; return t.usage; }
 const googleOn = () => !!env('GOOGLE_MAPS_API_KEY');
 const canSpend = (settings: any, kind: 'matrix' | 'routes', n: number) => googleOn() && usage(settings)[kind] + n <= MONTHLY_CAP;
-const placesKey = (places: any) => E.PLACES.map((k: string) => places[k] ? `${k}:${(+places[k].lat).toFixed(5)},${(+places[k].lng).toFixed(5)}` : `${k}:-`).join('|');
+const placesKey = (places: any) => KEY_PLACES.map(k => places[k] ? `${k}:${(+places[k].lat).toFixed(5)},${(+places[k].lng).toFixed(5)}` : `${k}:-`).join('|');
 const wp = (p: any) => ({ waypoint: { location: { latLng: { latitude: +p.lat, longitude: +p.lng } } } });
 const secs = (d: string | undefined) => d ? parseInt(String(d).replace('s', ''), 10) : NaN;
 async function gMatrix(origins: any[], dests: any[], departure?: Date) {
@@ -166,38 +148,38 @@ async function osrmTable(pts: { lat: number, lng: number }[]) {
 }
 const dist = (a: any, b: any) => { const R = 6371e3, t = Math.PI / 180, dLat = (b.lat - a.lat) * t, dLng = (b.lng - a.lng) * t; const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * t) * Math.cos(b.lat * t) * Math.sin(dLng / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(h)); };
 const localToDate = (date: string, min: number) => new Date(Date.parse(date + 'T00:00:00Z') + (min - TZ) * 60000);
+const knownPlaces = (places: any) => S.PLACES.filter((k: string) => places[k] && isFinite(+places[k].lat));
 
 /** Empty-road minutes between his places (the fallback). Cached until a place moves. */
-async function freeFlow(db: any, settings: any, force = false) {
-  const places = settings.places || {}, t = settings.travel = settings.travel || {}, key = placesKey(places);
+async function freeFlow(sb: any, uid: string, settings: any, force = false) {
+  const places = settings.places, t = settings.travel, key = placesKey(places);
   if (!force && t.computed_for === key) return t;
-  const have = E.PLACES.filter((k: string) => places[k] && isFinite(+places[k].lat));
-  for (const k of Object.keys(t)) if (/^[a-z]+-[a-z]+$/.test(k)) delete t[k];
+  const have = knownPlaces(places);
+  for (const k of Object.keys(t)) if (/^[a-z_]+-[a-z_]+$/.test(k)) delete t[k];
   t.computed_for = key; t.computed_at = new Date().toISOString(); t.profiles = {};
   if (have.length >= 2) {
     const m = await osrmTable(have.map((k: string) => places[k]));
     for (let i = 0; i < have.length; i++) for (let j = i + 1; j < have.length; j++) { const a = m[i][j], b = m[j][i]; if (a != null && b != null) t[[have[i], have[j]].sort().join('-')] = Math.round(Math.max(a, b) / 60); }
   }
-  await db.saveSettings({ travel: t });
+  await saveSettings(sb, uid, { travel: t });
   return t;
 }
-/** Google's predicted drive time by departure hour for the weekday of `date`. Cached 14 days per weekday. */
-async function trafficProfile(db: any, settings: any, date: string) {
-  const places = settings.places || {}, have = E.PLACES.filter((k: string) => places[k] && isFinite(+places[k].lat));
+/** Google's predicted drive time by hour for the weekday of `date`. Cached 14 days per weekday. */
+async function trafficProfile(sb: any, uid: string, settings: any, date: string) {
+  const places = settings.places, have = knownPlaces(places);
   if (have.length < 2 || !googleOn()) return null;
-  const t = settings.travel, dow = E.dowOf(date), key = placesKey(places);
+  const t = settings.travel, dow = S.dowOf(date), key = placesKey(places);
   const cached = t.profiles && t.profiles[dow];
   if (cached && cached.key === key && Date.now() - Date.parse(cached.at) < 14 * 864e5) return cached.data;
-  // every 2 hours from 6am to 10pm (Jarvis interpolates between), and never gym → gym: keeps six places inside the free monthly quota
   const HOURS = [6, 8, 10, 12, 14, 16, 18, 20, 22];
-  const pairs = have.flatMap((a: string) => have.filter((b: string) => b !== a && !(E.isGym(a) && E.isGym(b))).map((b: string) => [a, b]));
+  const pairs = have.flatMap((a: string) => have.filter((b: string) => b !== a && !(S.isGym(a) && S.isGym(b))).map((b: string) => [a, b]));
   const cost = HOURS.length * pairs.length;
   if (!canSpend(settings, 'matrix', cost)) return cached ? cached.data : null;
   const data: Record<string, [number, number][]> = {}, jobs: (() => Promise<void>)[] = [];
   for (const h of HOURS) {
     let when = localToDate(date, h * 60);
     while (when.getTime() < Date.now() + 5 * 60000) when = new Date(when.getTime() + 7 * 864e5);
-    for (const a of have) { const others = pairs.filter(p => p[0] === a).map(p => p[1]); if (!others.length) continue; jobs.push(async () => {
+    for (const a of have) { const others = pairs.filter((p: string[]) => p[0] === a).map((p: string[]) => p[1]); if (!others.length) continue; jobs.push(async () => {
       const m = await gMatrix([places[a]], others.map((b: string) => places[b]), when);
       others.forEach((b: string, i: number) => { const v = m[0][i]; if (v != null) (data[`${a}>${b}`] = data[`${a}>${b}`] || []).push([h * 60, Math.round(v * 10) / 10]); });
     }); }
@@ -206,66 +188,220 @@ async function trafficProfile(db: any, settings: any, date: string) {
   for (const k of Object.keys(data)) data[k].sort((x, y) => x[0] - y[0]);
   usage(settings).matrix += cost;
   t.profiles = { ...(t.profiles || {}), [dow]: { key, at: new Date().toISOString(), data } };
-  await db.saveSettings({ travel: t });
+  await saveSettings(sb, uid, { travel: t });
   return data;
 }
-/** Where he is: one of his places (within 400 m), or 'here' with drive times from there. */
-async function whereAmI(db: any, settings: any, coords: any) {
-  const places = settings.places || {};
-  if (!coords || !isFinite(+coords.lat)) return { loc: null, freeFlow: {}, profile: {} };
-  const known = E.PLACES.filter((k: string) => places[k]);
+/** Where he is from a GPS fix: one of his places (within 400 m), or 'here' with drive times from there. */
+async function whereAmI(sb: any, uid: string, settings: any, coords: any) {
+  const places = settings.places, known = knownPlaces(places);
+  if (!coords || !isFinite(+coords.lat) || !known.length) return null;
   let best: string | null = null, bd = Infinity;
   for (const k of known) { const d = dist(coords, places[k]); if (d < bd) { bd = d; best = k; } }
-  if (best && bd <= 400) return { loc: best, freeFlow: {}, profile: {} };
-  if (!known.length) return { loc: null, freeFlow: {}, profile: {} };
+  if (best && bd <= 400) return { loc: best, profile: {} };
+  const profile: any = {};
   try {
     if (canSpend(settings, 'matrix', known.length)) {
       const m = await gMatrix([coords], known.map((k: string) => places[k]));
-      usage(settings).matrix += known.length; await db.saveSettings({ travel: settings.travel });
-      const profile: any = {}; known.forEach((k: string, i: number) => { const v = m[0][i]; if (v != null) profile[`here>${k}`] = [[0, v], [1439, v]]; });
-      return { loc: 'here', freeFlow: {}, profile };
+      usage(settings).matrix += known.length; await saveSettings(sb, uid, { travel: settings.travel });
+      known.forEach((k: string, i: number) => { const v = m[0][i]; if (v != null) profile[`here>${k}`] = [[0, v], [1439, v]]; });
+    } else {
+      const m = await osrmTable([coords, ...known.map((k: string) => places[k])]);
+      known.forEach((k: string, i: number) => { const v = m[0][i + 1]; if (v != null) profile[`here>${k}`] = [[0, v / 60], [1439, v / 60]]; });
     }
-    const m = await osrmTable([coords, ...known.map((k: string) => places[k])]);
-    const ff: any = {}; known.forEach((k: string, i: number) => { const v = m[0][i + 1]; if (v != null) ff[['here', k].sort().join('-')] = Math.round(v / 60); });
-    return { loc: 'here', freeFlow: ff, profile: {} };
-  } catch { return { loc: null, freeFlow: {}, profile: {} }; }
+  } catch { return null; }
+  return { loc: 'here', profile };
 }
-function placesAdapter(db: any) {
-  return {
-    async drive({ settings, date, coords }: any) {
-      const parking = (settings.prefs && settings.prefs.parking) ?? 10;
-      const ff = await freeFlow(db, settings).catch(() => settings.travel || {});
-      let profile: any = null; try { profile = await trafficProfile(db, settings, date); } catch (e) { console.error('traffic', e); }
-      const where = coords ? await whereAmI(db, settings, coords) : { loc: null, freeFlow: {}, profile: {} };
-      const prof = (profile || Object.keys(where.profile).length) ? { ...(profile || {}), ...where.profile } : null;
-      return { drive: E.makeDrive({ profile: prof, freeFlow: { ...ff, ...where.freeFlow }, parking }), startLoc: where.loc };
-    }
-  };
+
+// ---------------------------------------------------------------- planning
+const refsDone = (plans: any[]) => { const s = new Set<string>(); for (const p of plans) for (const b of (p.plan?.blocks || [])) if (b.done && b.ref) s.add(b.ref); return s; };
+const locAfter = (b: any) => b.type === 'drive' ? b.to : b.type === 'errand' ? 'home' : b.loc;
+
+/** Where he is now: a fresh GPS fix, else the last thing he checked off today, else where today's plan has him. */
+function placeNow(todayPlan: any, now: { min: number }, classes: any[], date: string) {
+  const bl = (todayPlan?.blocks || []) as any[];
+  const doneLast = bl.filter(b => b.done && b.loc !== 'car').sort((a, b) => (a.doneAtMin ?? a.end) - (b.doneAtMin ?? b.end)).pop();
+  const inClass = classes.some(c => +c.weekday === S.dowOf(date) && S.toMin(c.start_time)! <= now.min && S.toMin(c.end_time)! > now.min);
+  if (inClass) return { loc: 'uni', how: 'in class' };
+  if (doneLast) return { loc: locAfter(doneLast), how: `you checked “${doneLast.title}”` };
+  const cur = bl.filter(b => b.type !== 'wake' && b.type !== 'sleep' && b.start <= now.min && !b.instant).pop();
+  return { loc: cur ? (cur.type === 'drive' && cur.end > now.min ? cur.to : locAfter(cur)) || 'home' : 'home', how: 'from the plan' };
 }
-async function eta(db: any, settings: any, coords: any, to: string) {
-  const places = settings.places || {};
-  if (!coords || !places[to]) return { error: `Set your ${to} location first.` };
-  const parking = to === 'uni' ? ((settings.prefs && settings.prefs.parking) ?? 10) : 0;
-  if (canSpend(settings, 'routes', 1)) {
-    const live = await gRoute(coords, places[to]);
-    usage(settings).routes += 1; await db.saveSettings({ travel: settings.travel });
-    if (live != null) return { minutes: Math.ceil(live) + parking, drive: Math.ceil(live), parking, live: true };
+
+async function replan(sb: any, uid: string, opts: { coords?: any, reason?: string | null, fresh?: boolean } = {}) {
+  const now = localNow(), today = now.date;
+  const D = await loadAll(sb, uid, today);
+  const st = D.settings;
+  if (opts.coords && isFinite(+opts.coords.lat)) { st.prefs.lastFix = { lat: +(+opts.coords.lat).toFixed(5), lng: +(+opts.coords.lng).toFixed(5), at: new Date().toISOString() }; await saveSettings(sb, uid, { prefs: st.prefs }); }
+  const ff = await freeFlow(sb, uid, st).catch(() => st.travel);
+  const profiles: Record<string, any> = {};
+  for (let i = 0; i <= DAYS_AHEAD; i++) { const d = S.addDays(today, i); const dw = S.dowOf(d); if (!(dw in profiles)) profiles[dw] = await trafficProfile(sb, uid, st, d).catch(e => { console.error('traffic', e); return null; }); }
+  const byDate: Record<string, any> = Object.fromEntries(D.plans.map((p: any) => [p.date, p.plan]));
+  const todayPlan = byDate[today];
+  const yesterday = byDate[S.addDays(today, -1)];
+
+  // where he is
+  let here: any = null, loc = 'home', how = '';
+  const fix = st.prefs.lastFix, fresh = fix && Date.now() - Date.parse(fix.at) < 15 * 60000 ? fix : null;
+  if (fresh) { here = await whereAmI(sb, uid, st, fresh); if (here) { loc = here.loc; how = loc === 'here' ? 'your live location' : `you’re at ${S.PLACE_NAME[loc]}`; } }
+  if (!here) { const p = placeNow(todayPlan, now, D.classes, today); loc = p.loc; how = p.how; }
+
+  const started = todayPlan && !opts.fresh && todayPlan.wake != null && now.min >= todayPlan.wake;
+  const rules = { ...(st.prefs.rules || {}) };
+  const driveFor = (date: string) => S.makeDrive({ profile: { ...(profiles[S.dowOf(date)] || {}), ...(date === today && here ? here.profile : {}) }, freeFlow: ff });
+  const done = refsDone(D.plans);
+  // what was planned earlier today counts as happened (meals, drives, errands, walking) — only uni work he didn't check moves forward,
+  // and the gym follows PPL Coach (a logged session is a done gym)
+  let walkedSoFar = 0;
+  if (started) for (const b of todayPlan.blocks || []) if (b.end <= now.min) {
+    if (b.ref && !['study', 'gym'].includes(b.type)) done.add(b.ref);
+    if (b.walk && (b.done || b.type !== 'walk')) walkedSoFar += b.walk; else if (b.type === 'walk') walkedSoFar += b.walk || 0;
   }
-  const m = await osrmTable([coords, places[to]]);
-  const raw = m[0][1] == null ? null : m[0][1]! / 60;
-  return raw == null ? { error: 'No route found.' } : { minutes: Math.ceil(raw) + parking, drive: Math.ceil(raw), parking, live: false };
+  const out = S.planDays({ from: today, n: DAYS_AHEAD, today, classes: D.classes, events: D.events, ppl: D.ppl, nutrition: D.nutrition, rules,
+    known: [...knownPlaces(st.places), ...(here && here.loc === 'here' ? ['here'] : [])], driveFor, changes: mergeChanges(D.dayChanges), doneRefs: [...done],
+    firstStart: started ? { min: now.min, loc } : null, firstWalkDone: walkedSoFar,
+    prevBedAbs: yesterday && yesterday.bed != null ? yesterday.bed - 1440 : null });
+
+  // today: keep what already happened or was checked, add the new rest of the day
+  const days = out.days;
+  if (started) {
+    const kept = (todayPlan.blocks || []).filter((b: any) => b.done || b.end <= now.min || b.type === 'wake' || (b.type === 'maid' && b.start <= now.min));
+    const keptRefs = new Set(kept.map((b: any) => b.ref).filter(Boolean));
+    days[0].blocks = [...kept, ...days[0].blocks.filter((b: any) => !b.ref || !keptRefs.has(b.ref))].sort((a: any, b: any) => a.start - b.start);
+    days[0].wake = todayPlan.wake;
+  }
+  for (const d of days) {
+    const old = byDate[d.date];
+    // checks on future days survive a re-plan
+    const oldDone = new Map(((old && old.blocks) || []).filter((b: any) => b.done && b.ref).map((b: any) => [b.ref, b]));
+    for (const b of d.blocks) if (b.ref && oldDone.has(b.ref)) { b.done = true; b.doneAt = (oldDone.get(b.ref) as any).doneAt; }
+    d.where = d.date === today ? { loc, how } : null;
+    d.sig = signature(d);
+    d.check = old && old.sig === d.sig ? old.check || null : null;     // keep the AI check while the day is unchanged
+    d.planned_at = new Date().toISOString();
+    d.reason = d.date === today ? opts.reason || null : null;
+    await savePlan(sb, uid, d.date, d);
+  }
+  return { days, loc, how, settings: st, D };
 }
-/** Coordinates from a Google Maps link (short links are followed, but only to Google). */
+const signature = (d: any) => d.blocks.filter((b: any) => !b.done).map((b: any) => `${b.type}${b.startT}${b.title}`).join('|');
+
+// ---------------------------------------------------------------- the AI parts
+const CHANGE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    noGym: { type: 'boolean', description: 'No gym that day.' },
+    gymAt: { type: 'string', description: 'HH:MM — he wants to train at this time.' },
+    gymPlace: { type: 'string', enum: S.GYMS, description: 'He wants this branch.' },
+    cancelClasses: { description: 'true = no classes that day, or a list of course codes that are off.', anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
+    busy: { type: 'array', description: 'Times he is busy somewhere.', items: { type: 'object', additionalProperties: false, required: ['from', 'to', 'title', 'place'], properties: {
+      from: { type: 'string', description: 'HH:MM' }, to: { type: 'string', description: 'HH:MM' }, title: { type: 'string' },
+      place: { type: 'string', enum: ['home', 'grandma', 'uni', 'gym_rigae', 'gym_mahboula', 'gym_sabah', 'other'] } } } },
+    skipMeals: { type: 'array', items: { type: 'string', enum: ['breakfast', 'lunch', 'preworkout', 'dinner', 'evening'] }, description: 'Meals he won’t eat from the plan that day (e.g. eating out covers dinner).' },
+    tasks: { type: 'array', description: 'Extra things to fit in.', items: { type: 'object', additionalProperties: false, required: ['title', 'minutes'], properties: { title: { type: 'string' }, minutes: { type: 'number' }, at: { type: 'string', description: 'HH:MM if he gave a time' } } } },
+    wakeAt: { type: 'string', description: 'HH:MM' }, bedBy: { type: 'string', description: 'HH:MM' },
+    noGroceries: { type: 'boolean' }
+  }
+};
+const RULE_KEYS = Object.keys(S.RULES);
+const TELL_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['reply', 'dayChanges', 'ruleChanges', 'notes', 'forget'],
+  properties: {
+    reply: { type: 'string', description: 'One or two short sentences to Salah: what you changed. Plain words, no jargon.' },
+    dayChanges: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['date', 'summary', 'change'], properties: {
+      date: { type: 'string', description: 'YYYY-MM-DD' }, summary: { type: 'string', description: 'What he said, short, e.g. "No gym today"' }, change: CHANGE_SCHEMA } } },
+    ruleChanges: { type: 'array', description: 'A standing change to one of his rules (from now on).', items: { type: 'object', additionalProperties: false, required: ['key', 'value', 'summary'], properties: {
+      key: { type: 'string', enum: RULE_KEYS }, value: { type: 'number' }, summary: { type: 'string' } } } },
+    notes: { type: 'array', items: { type: 'string' }, description: 'Standing things to remember that none of the fields above can express. Say in the reply that these are noted but not automatic.' },
+    forget: { type: 'array', items: { type: 'string' }, description: 'ids of earlier changes/notes he wants dropped' }
+  }
+};
+const RULE_TEXT = `His rules (already built in — don't re-add them):
+- Classes are fixed; leave to be at uni ${S.RULES.classEarly} min before class (covers parking).
+- Quiz/assignment/pre-lab/homework: 30 min on the day it opens (no open date → 48 h before the deadline). Graded lab: 30 min revision the day before. GCA: 2 h study 2 days before. Exams: 3 h a day from 14 days before exam week, 4 h a day from 7 days before.
+- Gym every day unless he says no. Branch closest to where he is / goes next (Rigae on ties). Never Sabah Al-Salem 5–9am or 11am–3pm. 10pm–4am quiet, 4pm–9pm packed.
+- Groceries every Saturday. Meals from Nutrition Coach; the maid cooks 7am–9pm; he cooks outside that. Cooler in the car; microwaves at the gyms and the gas station near uni.
+- 1.5 h on the walking pad at home a day. Sleep: 8 h preferred, never under 6 h. Priority when short on time: uni → gym → food → sleep.
+Rule numbers you can change (minutes unless noted): ${RULE_KEYS.map(k => `${k}=${(S.RULES as any)[k]}`).join(', ')}.`;
+
+async function tell(sb: any, uid: string, message: string, coords: any) {
+  const now = localNow(), today = now.date;
+  const D = await loadAll(sb, uid, today);
+  const week = D.plans.filter((p: any) => p.date >= today).slice(0, 3).map((p: any) => `${S.dlong(p.date)} (${p.date}): ${(p.plan.blocks || []).filter((b: any) => !['wake', 'maid'].includes(b.type)).map((b: any) => `${S.t12(b.start)} ${b.title}`).join(' · ')}`).join('\n');
+  const changes = D.dayChanges.map((m: any) => `[${m.id}] ${m.date}: ${m.text}`).join('\n') || 'none';
+  const notes = D.notes.map((m: any) => `[${m.id}] ${m.text}`).join('\n') || 'none';
+  const ruleNow = JSON.stringify(D.settings.prefs.rules || {});
+  const a = await aiJson({
+    system: `You are Jarvis, Salah's scheduling assistant in Kuwait. A rule-based planner builds his day; your only job here is to turn what he just told you into structured changes for it. Today is ${S.DAYS[S.dowOf(today)]} ${today}, it's ${S.t12(now.min)}. "Today/tonight/tomorrow" are relative to that.\n\n${RULE_TEXT}\n\nOnly record what he actually said. A one-day thing goes in dayChanges (one entry per date). "From now on / always / every …" goes in ruleChanges if it maps to a rule number, otherwise notes. If he asks a question, answer it in reply and change nothing. Never invent times he didn't give.`,
+    user: `What he said: """${message.slice(0, 1500)}"""\n\nThe next days as planned now:\n${week || '(no plan yet)'}\n\nChanges he already told you (id, date, text):\n${changes}\n\nStanding notes (id, text):\n${notes}\n\nRule numbers he already changed: ${ruleNow}`,
+    schema: TELL_SCHEMA, maxTokens: 2500
+  });
+  for (const id of a.forget || []) await one(sb.from('jarvis_memory').delete().eq('user_id', uid).eq('id', id)).catch(() => {});
+  for (const c of a.dayChanges || []) if (/^\d{4}-\d{2}-\d{2}$/.test(c.date)) await one(sb.from('jarvis_memory').insert({ user_id: uid, kind: 'day', date: c.date, text: String(c.summary).slice(0, 480) || 'Change', overrides: c.change || {}, source: 'chat' }));
+  for (const n of a.notes || []) await one(sb.from('jarvis_memory').insert({ user_id: uid, kind: 'rule', strength: 'must', category: 'standing', text: String(n).slice(0, 480), source: 'chat' }));
+  if ((a.ruleChanges || []).length) {
+    const rules = { ...(D.settings.prefs.rules || {}) };
+    for (const r of a.ruleChanges) if (RULE_KEYS.includes(r.key) && isFinite(+r.value)) rules[r.key] = +r.value;
+    await saveSettings(sb, uid, { prefs: { ...D.settings.prefs, rules } });
+  }
+  await one(sb.from('jarvis_messages').insert([{ user_id: uid, role: 'user', body: message.slice(0, 2000) }, { user_id: uid, role: 'jarvis', body: a.reply, data: { dayChanges: a.dayChanges, ruleChanges: a.ruleChanges, notes: a.notes } }]));
+  const changed = (a.dayChanges || []).length || (a.ruleChanges || []).length || (a.forget || []).length;
+  let plan = null;
+  if (changed) { const r = await replan(sb, uid, { coords, reason: a.reply }); plan = r.days[0]; await checkDay(sb, uid, r.days[0]).catch(e => console.error('check', e)); }
+  return { reply: a.reply, changed: !!changed, plan };
+}
+
+const CHECK_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['ok', 'issues'],
+  properties: { ok: { type: 'boolean' }, issues: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['at', 'problem', 'fix'], properties: {
+    at: { type: 'string', description: 'time, e.g. 2:15pm' }, problem: { type: 'string' }, fix: { type: 'string', description: 'something he can tell Jarvis, e.g. "Move the gym to 10pm"' } } } } }
+};
+/** Claude double-checks a day is doable. Only when the day changed since the last check. */
+async function checkDay(sb: any, uid: string, day: any) {
+  if (!day || day.check || !env('ANTHROPIC_API_KEY')) return day && day.check;
+  const lines = day.blocks.filter((b: any) => b.type !== 'maid').map((b: any) => `${S.t12(b.start)}${b.end !== b.start ? '–' + S.t12(b.end) : ''} ${b.title}${b.loc && b.type !== 'drive' ? ` @${b.loc}` : ''}${b.detail ? ` (${String(b.detail).slice(0, 120)})` : ''}${b.done ? ' [done]' : ''}`).join('\n');
+  const a = await aiJson({
+    system: `You check Salah's daily plan, built by a rule-based planner, for whether it's actually doable. ${RULE_TEXT}\nLook for real problems only: impossible back-to-back moves, no time to eat or get from the car to class, drives that look too short for Kuwait traffic at that hour, meals at odd times, too little sleep, a deadline at risk, anything clashing with the changes he asked for. If it's fine, ok=true and no issues. At most 4 issues, each one short sentence. Times are local (Kuwait).`,
+    user: `${S.DAYS[S.dowOf(day.date)]} ${day.date}${day.where ? `, he is now at ${day.where.loc}` : ''}:\n${lines}\nPlanner warnings: ${(day.warnings || []).join(' / ') || 'none'}`,
+    schema: CHECK_SCHEMA, maxTokens: 1200
+  });
+  day.check = { ok: !!a.ok, issues: (a.issues || []).slice(0, 4), at: new Date().toISOString() };
+  await savePlan(sb, uid, day.date, day);
+  return day.check;
+}
+
+/** Live traffic says a drive takes longer than planned. Rules move the leave time; Claude decides only if that breaks something. */
+async function trafficShift(sb: any, uid: string, plan: any, i: number, need: number, nowMin: number) {
+  const b = plan.blocks[i], planned = b.end - b.start, extra = Math.ceil(need - planned);
+  if (extra < 3) return null;
+  const newStart = b.end - Math.ceil(need);
+  const prev = plan.blocks.filter((x: any) => x.end > newStart && x.start < b.start && !x.done && !x.instant && x !== b && x.type !== 'wake').pop();
+  if (newStart >= nowMin && (!prev || !['class', 'exam', 'gym', 'busy'].includes(prev.type))) {
+    b.start = newStart; b.startT = S.hhmm(newStart); b.trafficNote = `Traffic: +${extra} min`; b.detail = `${Math.ceil(need)} min drive now · ${b.detail.replace(/^\d+ min drive · /, '')}`;
+    if (prev) { prev.end = Math.max(prev.start, newStart); prev.endT = S.hhmm(prev.end); }
+    await savePlan(sb, uid, plan.date, plan);
+    return { title: `Leave at ${S.t12(newStart)} — traffic`, body: `${b.title.replace('Leave for', 'To')} takes ${Math.ceil(need)} min right now (${extra} more than planned).${prev ? ` ${prev.title} ends a bit earlier.` : ''}` };
+  }
+  // can't absorb it: ask Claude what to do, tell him straight
+  const late = Math.max(0, nowMin - newStart);
+  const a = await aiJson({
+    system: `You are Jarvis, Salah's scheduling assistant. Live traffic just made a planned drive longer. Decide the most useful thing to tell him in a phone notification. ${RULE_TEXT}`,
+    user: `Now ${S.t12(nowMin)}. Drive: ${b.title} (${b.detail}), planned to leave ${S.t12(b.start)}, takes ${Math.ceil(need)} min now instead of ${planned}. ${late ? `Even leaving now he arrives about ${late} min later than planned.` : `He'd have to leave at ${S.t12(newStart)}, which cuts into: ${prev ? prev.title : 'nothing'}.`}\nRest of today: ${plan.blocks.filter((x: any) => x.start >= b.start).map((x: any) => `${S.t12(x.start)} ${x.title}`).join(' · ')}`,
+    schema: { type: 'object', additionalProperties: false, required: ['title', 'body'], properties: { title: { type: 'string', description: 'max 50 chars' }, body: { type: 'string', description: 'max 180 chars, what to do now' } } },
+    maxTokens: 400
+  });
+  b.trafficNote = `Traffic: +${extra} min`; await savePlan(sb, uid, plan.date, plan);
+  return a;
+}
+
+// ---------------------------------------------------------------- requests from the app
 async function resolveLink(url: any) {
   let u = String(url || '').trim();
-  if (!/^https?:\/\//i.test(u)) throw new Error('Paste a Google Maps link, or coordinates like 29.31, 47.98.');
+  if (!/^https?:\/\//i.test(u)) throw new Error('Paste a Google Maps link.');
   const googleHost = (h: string) => /(^|\.)google\.[a-z.]+$/.test(h) || /(^|\.)goo\.gl$/.test(h);
   const parse = (s: string) => {
-    let t = s; try { t = decodeURIComponent(s); } catch { /* a page or link with a stray % — read it as it is */ }
+    let t = s; try { t = decodeURIComponent(s); } catch { /* keep as is */ }
     const m = t.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/) || t.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/) || t.match(/[?&](?:q|query|ll|center|destination)=(-?\d+\.\d+),\s*(-?\d+\.\d+)/);
-    if (!m) return null;
-    const name = t.match(/\/place\/([^/@?]+)/);
-    return { lat: +(+m[1]).toFixed(6), lng: +(+m[2]).toFixed(6), label: name ? name[1].replace(/\+/g, ' ').slice(0, 80) : null };
+    return m ? { lat: +(+m[1]).toFixed(6), lng: +(+m[2]).toFixed(6) } : null;
   };
   for (let i = 0; i < 5; i++) {
     if (!googleHost(new URL(u).hostname)) throw new Error('That isn’t a Google Maps link.');
@@ -275,11 +411,10 @@ async function resolveLink(url: any) {
     if (!loc) { const h2 = parse((await r.text()).slice(0, 200000)); if (h2) return h2; break; }
     u = new URL(loc, u).href;
   }
-  throw new Error('I couldn’t find a location in that link. Use “I’m here” at the place, or paste its coordinates.');
+  throw new Error('I couldn’t find a location in that link. Open Jarvis at the place and use “I’m here” instead.');
 }
 
-// ---------------------------------------------------------------- requests from the app
-Deno.serve(async req => {
+async function handler(req: Request) {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS });
   try {
     await loadConfig();
@@ -292,45 +427,63 @@ Deno.serve(async req => {
     const sb = createClient(env('SUPABASE_URL'), env('SUPABASE_ANON_KEY'), { global: { headers: { Authorization: auth } }, auth: { persistSession: false } });
     const { data: { user } } = auth ? await sb.auth.getUser(auth.replace(/^Bearer\s+/i, '')) : { data: { user: null } };
     if (!user) return json({ error: 'Sign in first.' }, 401);
+    const uid = user.id;
     const body = await req.json().catch(() => ({}));
     const action = body.action || 'plan';
-    if (action === 'resolve-link') return json(await resolveLink(body.url));
-    if (action === 'test-push') return json(await testPush(user.id));
-    const db = supabaseDb(sb, user.id);
-    if (body.coords && isFinite(+body.coords.lat) && isFinite(+body.coords.lng)) {        // the server uses it for traffic checks while it's fresh
-      const { data: cur } = await sb.from('day_settings').select('prefs').eq('user_id', user.id).maybeSingle();
-      await db.saveSettings({ prefs: { ...((cur && cur.prefs) || {}), lastFix: { lat: +(+body.coords.lat).toFixed(5), lng: +(+body.coords.lng).toFixed(5), at: new Date().toISOString() } } }).catch(() => {});
+    const coords = body.coords && isFinite(+body.coords.lat) && isFinite(+body.coords.lng) ? { lat: +body.coords.lat, lng: +body.coords.lng } : null;
+
+    if (action === 'plan') {
+      const r = await replan(sb, uid, { coords, reason: body.reason || null });
+      background(checkDay(sb, uid, r.days[0]).then(() => checkDay(sb, uid, r.days[1])));
+      return json({ today: r.days[0], where: { loc: r.loc, how: r.how } });
     }
-    const J = createJarvis({ db, ai: { json: aiJson }, places: placesAdapter(db), clock, planBudgetMs: 95000 });
-    if (action === 'plan') return json(await J.plan({ date: body.date, nowMin: body.nowMin, coords: body.coords, request: body.request ? String(body.request).slice(0, 600) : null }));
-    if (action === 'solve') return json(await J.solve({ date: body.date, i: body.i, about: body.about, problem: body.problem, missing: body.missing, nowMin: body.nowMin, coords: body.coords }));
-    if (action === 'choose') return json(await J.choose({ date: body.date, id: body.id, option: body.option, nowMin: body.nowMin, coords: body.coords }));
-    if (action === 'pantry') return json(await J.setPantry({ changes: body.changes || [] }));
-    if (action === 'kitchen') return json(await J.kitchen());
-    if (action === 'goals') return json(await J.goals());
-    if (action === 'mark') return json(await J.addMark({ ref: body.ref, course: body.course, title: body.title, weight: body.weight, score: body.score, outOf: body.outOf }));
-    if (action === 'ask') return json(await J.ask({ date: body.date, message: body.message, nowMin: body.nowMin, coords: body.coords }));
-    if (action === 'ahead') return json({ days: await J.ahead() });
-    if (action === 'review') return json(body.app ? { [body.app]: await J.review({ app: body.app }) } : await J.reviewAll());
-    if (action === 'report') return json({ report: await J.report() });
-    const settings = (await db.load()).settings;
-    if (action === 'travel') return json({ travel: await freeFlow(db, settings, true) });
-    if (action === 'eta') return json(await eta(db, settings, body.coords, body.to));
-    if (action === 'traffic') {                                     // the app saw a live drive time that no longer fits
-      const t = await eta(db, settings, body.coords, body.to);
-      if (t.error || t.minutes == null) return json({ action: 'none', error: t.error });
-      return json(await J.traffic({ date: body.date, i: body.i, need: t.minutes, nowMin: body.nowMin, coords: body.coords, source: 'from his phone, live' }));
+    if (action === 'tick') {
+      const p = await one(sb.from('day_plans').select('plan').eq('user_id', uid).eq('date', body.date).maybeSingle());
+      if (!p) return json({ error: 'No plan for that day.' }, 404);
+      const b = (p.plan.blocks || []).find((x: any) => x.ref === body.ref);
+      if (!b) return json({ error: 'That item isn’t in the plan any more.' }, 404);
+      const now = localNow();
+      b.done = !!body.done; b.doneAt = body.done ? new Date().toISOString() : null; b.doneAtMin = body.done ? now.min : null;
+      await savePlan(sb, uid, body.date, p.plan);
+      if (body.date !== now.date) return json({ ok: true });
+      const r = await replan(sb, uid, { coords, reason: null });
+      background(checkDay(sb, uid, r.days[0]));
+      return json({ today: r.days[0], where: { loc: r.loc, how: r.how } });
     }
+    if (action === 'tell') {
+      if (!String(body.message || '').trim()) return json({ error: 'Say something first.' }, 400);
+      return json(await tell(sb, uid, String(body.message), coords));
+    }
+    if (action === 'forget') {
+      await one(sb.from('jarvis_memory').delete().eq('user_id', uid).eq('id', body.id));
+      const r = await replan(sb, uid, { coords });
+      return json({ today: r.days[0] });
+    }
+    if (action === 'rule') {                                           // reset one rule number to his default
+      const st = await one(sb.from('day_settings').select('prefs').eq('user_id', uid).maybeSingle()) || { prefs: {} };
+      const rules = { ...((st.prefs || {}).rules || {}) }; delete rules[body.key];
+      await saveSettings(sb, uid, { prefs: { ...(st.prefs || {}), rules } });
+      const r = await replan(sb, uid, {}); return json({ today: r.days[0] });
+    }
+    if (action === 'place') {
+      if (!S.PLACES.includes(body.key)) return json({ error: 'Unknown place.' }, 400);
+      const at = coords || await resolveLink(body.url);
+      const st = await one(sb.from('day_settings').select('places').eq('user_id', uid).maybeSingle()) || { places: {} };
+      await saveSettings(sb, uid, { places: { ...(st.places || {}), [body.key]: { lat: at.lat, lng: at.lng, label: body.label || S.PLACE_NAME[body.key] } } });
+      const r = await replan(sb, uid, {});
+      return json({ ok: true, at, today: r.days[0] });
+    }
+    if (action === 'test-push') return json(await testPush(uid));
     return json({ error: 'Unknown action' }, 400);
   } catch (e) {
     console.error(e);
-    return json({ error: String((e as Error).message || e), errors: (e as any).errors || undefined }, 500);
+    return json({ error: String((e as Error).message || e) }, 500);
   }
-});
+}
+if (!env('JARVIS_TEST')) Deno.serve(handler);
+export { handler, replan, tell, checkDay, notifyUser, loadAll };
 
 // ---------------------------------------------------------------- notifications + scheduled work
-const NOTIFY_DEFAULTS = { tomorrow: true, wake: true, leave: true, lead: 10, report: true, blocks: { gym: true, study: true, homework: true, cook: true, meal: false, sleep: true } };
-const notifyPrefs = (settings: any) => { const n = (settings.prefs && settings.prefs.notify) || {}; return { ...NOTIFY_DEFAULTS, ...n, blocks: { ...NOTIFY_DEFAULTS.blocks, ...(n.blocks || {}) } }; };
 async function deliver(uid: string, subs: any[], payload: Record<string, unknown>, ttl = 1800) {
   let ok = 0;
   for (const s of subs.filter(x => x.user_id === uid)) {
@@ -346,11 +499,10 @@ async function testPush(uid: string) {
   if (!cfg.vapid.privateKey) return { error: 'Push keys are not set up.' };
   const { data: subs } = await svc().from('jarvis_push_subs').select('*').eq('user_id', uid);
   if (!subs?.length) return { error: 'No devices have Jarvis notifications turned on yet.' };
-  const ok = await deliver(uid, subs, { title: 'Jarvis', body: 'Notifications are working on this device.', tag: 'test', url: './' });
-  return { devices: subs.length, delivered: ok };
+  return { devices: subs.length, delivered: await deliver(uid, subs, { title: 'Jarvis', body: 'Notifications work on this device.', tag: 'test', url: './' }) };
 }
-async function claim(uid: string, key: string, value: string | null = null) {
-  const { data, error } = await svc().from('jarvis_sent').upsert({ user_id: uid, key, value }, { onConflict: 'user_id,key', ignoreDuplicates: true }).select('key');
+async function claim(uid: string, key: string) {
+  const { data, error } = await svc().from('jarvis_sent').upsert({ user_id: uid, key }, { onConflict: 'user_id,key', ignoreDuplicates: true }).select('key');
   if (error) { console.error(error); return false; }
   return !!data?.length;
 }
@@ -360,7 +512,6 @@ async function sendOnce(uid: string, subs: any[], key: string, payload: Record<s
   if (!ok) await svc().from('jarvis_sent').delete().eq('user_id', uid).eq('key', key);
   return ok;
 }
-// Long work (Claude) keeps running after the cron call returns.
 const background = (p: Promise<unknown>) => { const w = (globalThis as any).EdgeRuntime?.waitUntil; if (w) w.call((globalThis as any).EdgeRuntime, p.catch(e => console.error('background', e))); else p.catch(e => console.error('background', e)); };
 
 async function runCron() {
@@ -369,87 +520,66 @@ async function runCron() {
   const users = [...new Set((subs ?? []).map((s: any) => s.user_id))] as string[];
   const now = localNow();
   let sent = 0;
-  for (const uid of users) { try { sent += await notifyUser(uid, subs!, now.date, now.min); } catch (e) { console.error('cron user', e); } }
+  for (const uid of users) { try { sent += await notifyUser(uid, subs!, now); } catch (e) { console.error('cron user', e); } }
   if (now.min % 60 === 0) await svc().from('jarvis_sent').delete().lt('sent_at', new Date(Date.now() - 3 * 864e5).toISOString());
   return { users: users.length, sent };
 }
 
-const bringText = (p: any) => (p.bring || []).length ? `Bring: ${(p.bring || []).map((b: any) => b.what).join(', ')}.` : '';
-const maidText = (p: any) => { const m = (p.blocks || []).filter((b: any) => b.type === 'cook' && b.by === 'maid' && b.message); return m.length ? `Text your maid tonight: ${m.map((b: any) => `“${b.message}”`).join(' ')}` : ''; };
-const firstClassText = (p: any) => { const c = (p.blocks || []).find((b: any) => b.type === 'class' || b.type === 'exam'); const lv = (p.blocks || []).find((b: any) => b.type === 'travel' && b.to === 'uni'); return c ? `Leave ${E.t12(E.toMin(lv ? lv.start : c.start))} for ${c.title} at ${E.t12(E.toMin(c.start))}.` : ''; };
-
-async function notifyUser(uid: string, subs: any[], today: string, n: number) {
-  const db = supabaseDb(svc(), uid);
-  const J = createJarvis({ db, ai: { json: aiJson }, places: placesAdapter(db), clock, planBudgetMs: 120000 });
-  const { data: st } = await svc().from('day_settings').select('prefs').eq('user_id', uid).maybeSingle();
-  const np = notifyPrefs({ prefs: st && st.prefs || {} });
-  const within = (t: number) => n >= t && n < t + 15;               // tolerate a late or skipped cron run
+async function notifyUser(uid: string, subs: any[], now: { date: string, min: number }) {
+  const sb = svc(), today = now.date, n = now.min;
+  const within = (t: number, w = 5) => n >= t && n < t + w;
   let sent = 0;
-  const todayPlan = await db.getPlan(today);
-  const tomorrow = E.addDays(today, 1);
-
-  // evening: Jarvis plans tomorrow and tells him when to get up (about 90 min before tonight's lights out, else 19:30)
-  const sleepB = todayPlan && (todayPlan.blocks || []).find((b: any) => b.type === 'sleep');
-  const eveningAt = sleepB ? Math.max(18 * 60, E.planMin(sleepB.start)! - 90) : 19 * 60 + 30;
-  if (np.tomorrow && n >= eveningAt && n < 23 * 60 + 30 && !(await db.getPlan(tomorrow)) && await claim(uid, `tplan:${tomorrow}`)) {
-    background((async () => {
-      const r = await J.plan({ date: tomorrow });
-      const w = r.plan.blocks.find((b: any) => b.type === 'wake');
-      await deliver(uid, subs, { title: `Tomorrow: up at ${w ? E.t12(E.toMin(w.start)) : '—'}`, body: [r.plan.summary, firstClassText(r.plan), bringText(r.plan), maidText(r.plan)].filter(Boolean).join(' '), tag: 'tomorrow', url: './' }, 43200);
-    })());
+  // the whole week is rebuilt every night at 3am (new deadlines, PPL Coach and Nutrition Coach changes); and whenever today has no plan
+  let p0 = await one(sb.from('day_plans').select('plan').eq('user_id', uid).eq('date', today).maybeSingle());
+  if (p0 && p0.plan?.version !== 2) p0 = null;                     // a plan from the old Jarvis: make a new one
+  if ((n >= 180 && n < 195 && await claim(uid, `nightly:${today}`)) || (!p0 && await claim(uid, `gen:${today}:${Math.floor(n / 60)}`))) {
+    background(replan(sb, uid, { reason: null, fresh: n < 240 }).then(r => checkDay(sb, uid, r.days[0])));
+    return 0;
   }
-  // early morning: no plan yet for today → make one
-  if (!todayPlan && n >= 3 * 60 && n < 12 * 60 && await claim(uid, `gen:${today}`)) background(J.plan({ date: today }));
-  // nightly: fresh analysis of each app
-  if (n >= 2 * 60 && n < 2 * 60 + 15 && await claim(uid, `reviews:${today}`)) background(J.reviewAll());
-  // weekly report, Saturday 9pm
-  if (np.report && E.dowOf(today) === 6 && within(21 * 60) && await claim(uid, `report:${today}`)) background((async () => {
-    const r = await J.report();
-    await deliver(uid, subs, { title: 'Your weekly report is ready', body: r.headline || '', tag: 'report', url: './#ask' }, 43200);
-  })());
-  if (!todayPlan) return sent;
-  const blocks = (todayPlan.blocks || []) as any[];
+  if (!p0) return 0;
+  const plan = p0.plan, blocks = (plan.blocks || []) as any[];
+  const { data: st } = await sb.from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle();
+  const settings = st || { places: {}, prefs: {}, travel: {} }; settings.travel = settings.travel || {};
+  const fix = settings.prefs?.lastFix, fresh = fix && Date.now() - Date.parse(fix.at) < 15 * 60000 ? fix : null;
 
-  // wake-up brief
+  // wake up
   const wake = blocks.find(b => b.type === 'wake');
-  if (np.wake && wake && within(E.toMin(wake.start)!)) sent += await sendOnce(uid, subs, `wake:${today}`, { title: `Good morning — ${E.DAYS[E.dowOf(today)]}`, body: [todayPlan.summary, firstClassText(todayPlan)].filter(Boolean).join(' '), tag: 'wake', url: './' });
-
-  // live traffic: checked about 60, 35, 20 and 10 min before each drive, from his phone's last position when it's fresh.
-  // A delay Jarvis can absorb moves the leave time (out of free time); a bigger one re-plans the rest of the day. Either way he's told.
-  const { data: setRow } = await svc().from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle();
-  const settings = setRow || { places: {}, prefs: {}, travel: {} }, places = settings.places || {};
-  const fix = settings.prefs && settings.prefs.lastFix, fresh = fix && Date.now() - Date.parse(fix.at) < 15 * 60000 ? fix : null;
-  for (const [i, b] of blocks.entries()) {
-    if (b.type !== 'travel' || b.skipped || b.done || !b.to) continue;
-    const s = E.planMin(b.start)!, e = E.planMin(b.end)!;
-    if (n < s - 95 || n > e) continue;
-    const stage = (b.to === 'uni' ? [90, 60, 35, 20, 10] : [60, 35, 20, 10]).find(m => n >= s - m && n < s - m + 5);   // class drives are watched from 90 min out
-    const from = b.from || (i > 0 ? blocks[i - 1].loc : null), origin = fresh || (from && places[from]);
-    if (stage && origin && places[b.to] && canSpend(settings, 'routes', 1) && await claim(uid, `tchk:${today}:${b.to}:${b.end}:${stage}`)) {
-      background((async () => {
-        const live = await gRoute(origin, places[b.to]);
-        usage(settings).routes += 1; await db.saveSettings({ travel: settings.travel });
-        if (live == null) return;
-        const need = Math.ceil(live) + (b.to === 'uni' ? ((settings.prefs && settings.prefs.parking) ?? 10) : 0);
-        const r = await J.traffic({ date: today, i, need, nowMin: n, source: fresh ? 'from his phone\'s location' : 'from where the plan has him' });
-        if (['shift', 'replan', 'alert'].includes(r.action)) await deliver(uid, subs, { title: r.title, body: r.message, tag: 'traffic', url: './' }, 1800);
-      })());
-    }
-    if (np.leave && n >= s - np.lead && n < e) {
-      const next = blocks.slice(i + 1).find((x: any) => !['travel', 'free'].includes(x.type));
-      const firstOut = from === 'home' && !blocks.slice(0, i).some((x: any) => x.type === 'travel' && (x.from || 'home') === 'home');
-      const shop = (b.shop || []).length ? `Stop for ${(b.shop as string[]).map(f => (E.FOODS as any)[f] ? (E.FOODS as any)[f][0].toLowerCase() : f).join(', ')} on the way.` : '';
-      sent += await sendOnce(uid, subs, `leave:${today}:${b.start}:${b.to}`, { title: `Leave ${n >= s ? 'now' : 'at ' + E.t12(s)} → ${(E.PLACE_NAME as any)[b.to]}`, body: [b.trafficNote || '', firstOut ? bringText(todayPlan) : '', shop, next ? `Next: ${next.title} at ${E.t12(E.toMin(next.start))}.` : ''].filter(Boolean).join(' '), tag: 'leave', url: './' }, 900);
-    }
+  if (wake && within(wake.start, 15)) {
+    const first = blocks.find(b => ['class', 'exam'].includes(b.type)), leave = blocks.find(b => b.type === 'drive' && !b.done);
+    sent += await sendOnce(uid, subs, `wake:${today}`, { title: `Good morning — ${S.DAYS[S.dowOf(today)]}`, body: [first ? `${first.title} at ${S.t12(first.start)}.` : 'No classes today.', leave ? `Leave at ${S.t12(leave.start)}.` : '', plan.gym ? `Gym: ${S.PLACE_NAME[plan.gym.at]} at ${S.t12(plan.gym.start)}.` : ''].filter(Boolean).join(' '), tag: 'wake', url: './' });
   }
-  // the start of each block he wants a nudge for
-  for (const b of blocks) {
-    if (b.done || b.skipped || !np.blocks[b.type] || b.by === 'maid') continue;
-    const s = E.planMin(b.start)!;
-    if (!within(b.type === 'sleep' ? s - 30 : s)) continue;
-    const title = b.type === 'sleep' ? `Lights out at ${E.t12(s)} — start winding down` : b.title;
-    const help = ['cook', 'gym', 'study', 'homework'].includes(b.type) ? 'Can’t right now? Open Jarvis → Problem? for options.' : '';
-    sent += await sendOnce(uid, subs, `blk:${today}:${b.start}:${b.type}`, { title, body: [b.detail, b.type === 'sleep' ? '' : `Until ${E.t12(E.planMin(b.end)!)}`, help].filter(Boolean).join(' · '), tag: 'block', url: './' }, 900);
+  // AI check found problems with today
+  if (plan.check && !plan.check.ok && plan.check.issues?.length && n >= (wake ? wake.start : 360) && n < 1380)
+    sent += await sendOnce(uid, subs, `check:${today}:${plan.sig?.length || 0}:${plan.check.at}`, { title: 'Jarvis: something in today won’t work', body: plan.check.issues.map((i: any) => `${i.at}: ${i.problem}`).join(' '), tag: 'check', url: './' }, 3600);
+
+  for (const [i, b] of blocks.entries()) {
+    if (b.done) continue;
+    // drives: live traffic ~60/35/20/10 min out (uni from 90), the leave reminder, and "where are you?" afterwards
+    if (b.type === 'drive') {
+      const s = b.start;
+      const stage = (b.to === 'uni' ? [90, 60, 35, 20, 10] : [60, 35, 20, 10]).find(m => n >= s - m && n < s - m + 5);
+      const origin = fresh || (b.from && b.from !== 'here' && settings.places[b.from]);
+      if (stage && origin && settings.places[b.to] && canSpend(settings, 'routes', 1) && await claim(uid, `tchk:${today}:${b.ref}:${stage}`)) {
+        background((async () => {
+          const live = await gRoute(origin, settings.places[b.to]);
+          usage(settings).routes += 1; await saveSettings(sb, uid, { travel: settings.travel });
+          if (live == null) return;
+          const msg = await trafficShift(sb, uid, plan, i, live, n);
+          if (msg) await deliver(uid, subs, { title: msg.title, body: msg.body, tag: 'traffic', url: './' }, 1800);
+        })());
+      }
+      const bring = (b.bring || []).length ? ` Bring: ${b.bring.map((x: string) => x.split(' — ')[0]).join(', ')}.` : '';
+      if (within(s - 10)) sent += await sendOnce(uid, subs, `leave10:${today}:${b.ref}`, { title: `Leave at ${S.t12(s)} → ${b.title.replace('Leave for ', '')}`, body: `${b.detail}.${bring}`, tag: 'leave', url: './' }, 900);
+      if (within(s)) sent += await sendOnce(uid, subs, `leave0:${today}:${b.ref}`, { title: `Leave now → ${b.title.replace('Leave for ', '')}`, body: `${b.detail}.${bring}`, tag: 'leave', url: './' }, 900);
+      // he should have arrived: if nothing confirms where he is, ask him to open the app (it sends his location)
+      if (within(b.end + 15, 10) && !fresh) sent += await sendOnce(uid, subs, `where:${today}:${b.ref}`, { title: `Made it to ${S.PLACE_NAME[b.to] || 'there'}?`, body: 'Open Jarvis so I can see where you are and keep the rest of today right. Tap the drive to check it off.', tag: 'where', url: './' }, 1800);
+      continue;
+    }
+    if (!b.check || ['class', 'exam', 'wake', 'sleep'].includes(b.type) || b.type === 'place') continue;
+    if (!within(b.start)) continue;
+    const title = b.type === 'maid' ? b.title : b.type === 'gym' ? `Gym: ${b.title}` : b.title;
+    const body = b.type === 'maid' ? 'Open Jarvis and tap it to copy the message.' : [b.detail, b.walk ? 'On the walking pad.' : '', b.supplements?.length ? `With: ${b.supplements.join(', ')}.` : ''].filter(Boolean).join(' ');
+    sent += await sendOnce(uid, subs, `blk:${today}:${b.ref}`, { title, body: String(body).slice(0, 240), tag: 'block', url: './' }, 900);
   }
   return sent;
 }

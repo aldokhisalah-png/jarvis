@@ -1,9 +1,9 @@
 // Offline cache + push notifications.
 // Bump VERSION whenever the app's files change, so installed copies pick up the new version.
-const VERSION = 'jarvis-v7';
+const VERSION = 'jarvis-v8';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'config.js', 'styles/app.css', 'vendor/supabase.js',
-  'src/main.js', 'src/app.js', 'src/engine.js', 'src/backend-supabase.js',
+  'src/main.js', 'src/app.js', 'src/scheduler.js', 'src/backend-supabase.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/badge-96.png', 'icons/apple-touch-icon.png'
 ];
 
