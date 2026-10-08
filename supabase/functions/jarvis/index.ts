@@ -50,15 +50,15 @@ async function loadConfig() {
 }
 
 // ---------------------------------------------------------------- Claude
-async function aiJson({ system, user, schema, maxTokens = 3000 }: any) {
+async function aiJson({ system, user, schema, maxTokens = 3000 }: any, attempt = 1): Promise<any> {
   const key = env('ANTHROPIC_API_KEY');
   if (!key) throw new Error('Jarvis needs ANTHROPIC_API_KEY in Supabase → Edge Functions → Secrets.');
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
     body: JSON.stringify({ model: MODEL, max_tokens: maxTokens,
-      system: `${system}\n\nAnswer by calling the "answer" tool exactly once.`,
-      messages: [{ role: 'user', content: user }], tools: [{ name: 'answer', description: 'Your answer.', input_schema: schema }], tool_choice: { type: 'auto' } })
+      system: `${system}\n\nAnswer by calling the "answer" tool exactly once, with every required field. Do not reply in plain text.`,
+      messages: [{ role: 'user', content: user }], tools: [{ name: 'answer', description: 'Your answer.', input_schema: schema }], tool_choice: { type: 'any' } })
   });
   const j = await r.json();
   if (!r.ok) throw new Error(`Claude request failed (${r.status}): ${j?.error?.message || 'unknown error'}`);
@@ -66,7 +66,9 @@ async function aiJson({ system, user, schema, maxTokens = 3000 }: any) {
   if (call) return call.input;
   const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n'), a = text.indexOf('{'), b = text.lastIndexOf('}');
   if (a >= 0 && b > a) { try { return JSON.parse(text.slice(a, b + 1)); } catch { /* fall through */ } }
-  throw new Error('Claude gave no answer.');
+  console.error('claude no answer', j.stop_reason, (j.content || []).map((c: any) => c.type).join(','), text.slice(0, 300));
+  if (attempt < 2) return aiJson({ system, user, schema, maxTokens: maxTokens * 2 }, attempt + 1);
+  throw new Error(`Claude gave no answer (${j.stop_reason}).`);
 }
 
 // ---------------------------------------------------------------- data
