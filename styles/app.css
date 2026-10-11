@@ -135,3 +135,7 @@ select.rin{width:auto}
 input[type=time].rin{width:auto}
 .rules li.chg .rin{border-color:rgba(142,197,255,.6)}
 .rules li:not(:has(.rv)){color:var(--ink-2)}
+.broken li{align-items:flex-start}
+.tag{flex:none;font-size:11px;border-radius:999px;padding:2px 9px;border:1px solid var(--line-2);color:var(--ink-2)}
+.tag.missed{color:var(--alert);border-color:rgba(255,138,122,.4)}
+.tag.plan{color:var(--gym);border-color:rgba(245,197,66,.35)}

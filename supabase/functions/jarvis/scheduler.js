@@ -215,8 +215,12 @@ export function uniWork(events = [], rules = RULES) {
         .sort((a, b) => a.due_at < b.due_at ? 1 : -1)[0];
       // pre-labs are submitted within 24 h before the lab, so they open then
       const fallbackH = e.kind === 'prelab' ? 24 : rules.openFallbackH;
-      const open = opener ? localOf(opener.due_at) : localOf(new Date(Date.parse(e.due_at) - fallbackH * 3600e3).toISOString());
-      work.push({ ref: `ev:${e.id}`, kind: e.kind, title: `${name}`, what: `${KIND_WORD[e.kind]} — do it`, minutes: rules.taskMin, from: open, until: due, opensGuessed: !opener });
+      // or an opening date written in its note ("opens 15 Oct", "opened 4 Oct")
+      const nm = !opener && String(e.note || '').match(/open(?:s|ed)\s+(?:\w{3}\s+)?(\d{1,2})\s+([A-Za-z]{3})/i);
+      let noted = null;
+      if (nm) { const mi = MON.findIndex(x => x.toLowerCase() === nm[2].toLowerCase()); if (mi >= 0) { let y = +due.date.slice(0, 4); const d = `${y}-${pad(mi + 1)}-${pad(+nm[1])}`; noted = { date: d > due.date ? `${y - 1}-${pad(mi + 1)}-${pad(+nm[1])}` : d, min: 0 }; } }
+      const open = opener ? localOf(opener.due_at) : noted || localOf(new Date(Date.parse(e.due_at) - fallbackH * 3600e3).toISOString());
+      work.push({ ref: `ev:${e.id}`, kind: e.kind, title: `${name}`, what: `${KIND_WORD[e.kind]} — do it`, minutes: rules.taskMin, from: open, until: due, opensGuessed: !opener && !noted });
       if (/presentation|q&a|interview/i.test(e.title || ''))
         work.push({ ref: `pres:${e.id}`, kind: 'presrev', title: `Revise for ${name}`, what: 'Presentation tomorrow', minutes: rules.presRevMin, day: addDays(due.date, -1) });
     } else if (e.kind === 'lab') {
@@ -831,3 +835,47 @@ export const RULE_TEXT = [
     { text: 'Grocery shopping takes', key: 'groceryMin', fmt: 'min' },
     { text: 'When time is short: uni → gym → food → sleep' } ] }
 ];
+
+// =====================================================================
+// RULE CHECK — which of his rules today's plan, or what he actually did, doesn't follow
+// =====================================================================
+/**
+ * plan: a saved day plan; nowMin: minutes now (today) or null (whole day); changes: what he told Jarvis for the day.
+ * Returns [{ rule, why, kind: 'plan' | 'missed' }] — 'plan' = Jarvis couldn't fit it, 'missed' = time passed and it isn't checked.
+ */
+export function ruleCheck(plan, rules = RULES, nowMin = null, changes = {}) {
+  const R = { ...RULES, ...(rules || {}) }, out = [], b = plan.blocks || [];
+  const past = x => nowMin != null && x.end <= nowMin, hm = m => m >= 60 ? `${Math.floor(m / 60)} h${m % 60 ? ' ' + (m % 60) + ' min' : ''}` : `${m} min`;
+  // walking pad
+  const walkPlanned = b.reduce((n, x) => n + (x.walk || 0), 0);
+  if (walkPlanned < R.walkMin) out.push({ rule: `Walking pad ${hm(R.walkMin)} a day`, why: `Only ${hm(walkPlanned)} fits in today’s plan — not enough time at home.`, kind: 'plan' });
+  const walkMissed = b.filter(x => x.walk && past(x) && !x.done).reduce((n, x) => n + x.walk, 0);
+  const walkDone = b.filter(x => x.walk && x.done).reduce((n, x) => n + x.walk, 0);
+  if (walkMissed) out.push({ rule: `Walking pad ${hm(R.walkMin)} a day`, why: `${hm(walkMissed)} of walking is in past items you didn’t check (${hm(walkDone)} done so far).`, kind: 'missed' });
+  // gym
+  const gym = b.find(x => x.type === 'gym');
+  if (!gym && !changes.noGym && !(plan.notes || []).some(n => /already logged|you said so/i.test(n))) out.push({ rule: 'Gym every day unless you say no', why: 'No gym session fits today.', kind: 'plan' });
+  if (gym && past(gym) && !gym.done) out.push({ rule: 'Gym every day unless you say no', why: `The ${t12(gym.start)} session isn’t checked.`, kind: 'missed' });
+  // sleep
+  const wake = b.find(x => x.type === 'wake'), slept = wake && (wake.detail || '').match(/(\d+) h(?: (\d+) min)?/);
+  if (slept) { const m = +slept[1] * 60 + +(slept[2] || 0); if (m < R.sleepPrefer) out.push({ rule: `Sleep ${hm(R.sleepPrefer)}${R.sleepMin < R.sleepPrefer ? ` (never under ${hm(R.sleepMin)})` : ''}`, why: `Last night: ${hm(m)}.`, kind: m < R.sleepMin ? 'missed' : 'plan' }); }
+  const sl = b.find(x => x.type === 'sleep'), tonight = sl && (sl.detail || '').match(/(\d+) h(?: (\d+) min)?/);
+  if (tonight) { const m = +tonight[1] * 60 + +(tonight[2] || 0); if (m < R.sleepPrefer) out.push({ rule: `Sleep ${hm(R.sleepPrefer)}`, why: `Tonight’s plan gives ${hm(m)}.`, kind: 'plan' }); }
+  // meals
+  for (const k of ['breakfast', 'lunch', 'dinner', 'evening']) {
+    const m = b.find(x => x.type === 'meal' && x.meal === k);
+    const name = { breakfast: 'Breakfast', lunch: 'Lunch', dinner: 'Dinner', evening: 'Evening shake' }[k];
+    const usual = { breakfast: wake ? wake.start + 30 : 600, lunch: R.lunchAt, dinner: R.dinnerAt, evening: 1440 }[k];
+    if (!m && !(changes.skipMeals || []).includes(k) && (nowMin == null || usual > nowMin)) out.push({ rule: 'Every meal from Nutrition Coach', why: `${name} isn’t in today’s plan.`, kind: 'plan' });
+    if (m && past(m) && !m.done) out.push({ rule: 'Every meal from Nutrition Coach', why: `${name} (${t12(m.start)}) isn’t checked.`, kind: 'missed' });
+  }
+  const pre = b.find(x => x.type === 'meal' && x.meal === 'preworkout');
+  if (gym && pre && !pre.nonStim && sl && sl.start - gym.start < R.stimFreeH * 60) out.push({ rule: `Non-stim pre-workout within ${R.stimFreeH} h of bed`, why: 'Today’s pre-workout has caffeine.', kind: 'plan' });
+  // uni work
+  for (const x of b.filter(x => x.type === 'study' && past(x) && !x.done)) out.push({ rule: 'Study sessions on their day', why: `${x.title} (${t12(x.start)}) isn’t checked.`, kind: 'missed' });
+  const g = b.find(x => x.type === 'errand'); if (g && past(g) && !g.done) out.push({ rule: 'Groceries every Saturday', why: 'Grocery shopping isn’t checked.', kind: 'missed' });
+  const maid = b.find(x => x.type === 'maid' && /tomorrow/.test(x.title)); if (maid && nowMin != null && nowMin > maid.start + 60 && !maid.done) out.push({ rule: 'Text the maid the night before', why: 'Tomorrow’s message isn’t marked as sent.', kind: 'missed' });
+  // anything the planner itself flagged (late for class, study that didn't fit, …)
+  for (const w of plan.warnings || []) if (!/sleep/i.test(w) && !/walking pad/i.test(w)) out.push({ rule: /class|exam/i.test(w) ? `At uni ${R.classEarly} min before class` : /study|time today/i.test(w) ? 'Study sessions on their day' : 'Your rules', why: w, kind: 'plan' });
+  return out;
+}

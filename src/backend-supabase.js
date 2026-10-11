@@ -24,7 +24,7 @@ function supabaseBackend(cfg) {
     },
     async changes() {
       const from = addDays(localOf(new Date().toISOString()).date, -1);
-      const r = await one(sb.from('jarvis_memory').select('id,kind,text,date,category,created_at').eq('user_id', uid).eq('active', true).order('created_at'));
+      const r = await one(sb.from('jarvis_memory').select('id,kind,text,date,category,overrides,created_at').eq('user_id', uid).eq('active', true).order('created_at'));
       return (r || []).filter(m => (m.kind === 'day' && m.date >= from) || (m.kind === 'rule' && m.category === 'standing'));
     },
     async settings() { const r = await one(sb.from('day_settings').select('places,prefs').eq('user_id', uid).maybeSingle()); return { places: {}, prefs: {}, ...(r || {}) }; },

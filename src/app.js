@@ -101,7 +101,17 @@ function todayTab() {
     ${next ? `<div class="card next"><div class="eb">Next drive</div><div class="big tnum">Leave ${t12(next.start)}</div><div>${esc(next.title)} · ${esc(next.detail)}</div>${(next.bring || []).length ? `<ul class="bring">${next.bring.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}</div>` : ''}
     ${plan.check ? (plan.check.ok ? '<div class="ok">✓ Jarvis checked today — it works.</div>' : '') : '<div class="ok dim">Jarvis is double-checking today…</div>'}
     <ol class="tl">${blocks.map(b => blockRow(b, p.date, true, n)).join('')}</ol>
-    <div class="center"><button class="btn ghost" data-act="replan">${S.busy ? 'Re-planning…' : 'Re-plan from where I am now'}</button></div>`;
+    <div class="center"><button class="btn ghost" data-act="replan">${S.busy ? 'Re-planning…' : 'Re-plan from where I am now'}</button></div>
+    ${rulesNotFollowed(plan, n, today)}`;
+}
+
+function rulesNotFollowed(plan, n, today) {
+  const ov = {}; for (const c of S.changes.filter(c => c.kind === 'day' && c.date === today)) for (const [k, v] of Object.entries(c.overrides || {})) ov[k] = v;
+  const list = SC.ruleCheck(plan, (S.settings && S.settings.prefs && S.settings.prefs.rules) || {}, n, ov);
+  const walk = (plan.blocks || []).reduce((a, x) => a + (x.walk || 0), 0), walked = (plan.blocks || []).filter(x => x.walk && x.done).reduce((a, x) => a + x.walk, 0);
+  return `<h2>Rules not followed today</h2>
+    ${list.length ? `<ul class="list broken">${list.map(x => `<li><span><b>${esc(x.rule)}</b><br><span class="dim">${esc(x.why)}</span></span><span class="tag ${x.kind}">${x.kind === 'plan' ? 'didn’t fit' : 'missed'}</span></li>`).join('')}</ul>` : '<p class="sub good">Every rule is followed so far today.</p>'}
+    <p class="sub">Walking pad: ${walked} of ${walk} min done so far. Walking during meals and study counts when you check that item.</p>`;
 }
 
 // ---------------------------------------------------------------- Calendar
