@@ -22,9 +22,11 @@ export const RULES = {
   taskMin: 30,             // quiz / assignment / pre-lab / homework
   openFallbackH: 48,       // no "opens" date in Uni Planner → assume it opened this long before the deadline
   labReviewMin: 30,        // revision the day before a graded lab
+  presRevMin: 15,          // revision the day before a presentation / project Q&A / interview
+  stimFreeH: 4,            // pre-workout with caffeine only if the workout starts 4 h or more before bed
   gcaStudyMin: 120, gcaDaysBefore: 2,
   examStartDays: 14, examDailyMin: 180, examFinalWeekMin: 240,
-  studyChunkMax: 120,      // longest single study block (his questionnaire answer)
+  studyChunkMax: 600,      // he prefers one long study session; it's split only when no gap is big enough
   sleepPrefer: 480, sleepMin: 360,
   walkMin: 120,            // walking pad, per day (under his desk: during study, meals and relaxing at home)
   maidFrom: 420, maidTo: 1260,
@@ -179,8 +181,8 @@ export const recipeLines = meal => (meal.items || []).filter(it => !it.custom &&
 export const itemsText = meal => (meal.items || []).map(it => it.custom ? it.name : `${FOODS[it.food][0].toLowerCase()} ${Math.round(it.grams)} g`).join(', ');
 
 // ---------------------------------------------------------------- Uni Planner → what he has to do
-const TASK_KINDS = ['quiz', 'assignment', 'prelab', 'hw'];
-const KIND_WORD = { quiz: 'Quiz', assignment: 'Assignment', prelab: 'Pre-lab', hw: 'Homework', lab: 'Graded lab', gca: 'GCA', exam: 'Exam' };
+const TASK_KINDS = ['quiz', 'assignment', 'prelab', 'hw', 'project'];
+const KIND_WORD = { quiz: 'Quiz', assignment: 'Assignment', prelab: 'Pre-lab', hw: 'Homework', project: 'Project', lab: 'Graded lab', gca: 'GCA', exam: 'Exam' };
 /** Exam weeks from Uni Planner's academic entries ("Midterm exams week (7–14 Nov)", "Final exams (16–24 Jan)"). */
 export function examWeeks(events = []) {
   const out = [];
@@ -214,6 +216,8 @@ export function uniWork(events = [], rules = RULES) {
       const fallbackH = e.kind === 'prelab' ? 24 : rules.openFallbackH;
       const open = opener ? localOf(opener.due_at) : localOf(new Date(Date.parse(e.due_at) - fallbackH * 3600e3).toISOString());
       work.push({ ref: `ev:${e.id}`, kind: e.kind, title: `${name}`, what: `${KIND_WORD[e.kind]} — do it`, minutes: rules.taskMin, from: open, until: due, opensGuessed: !opener });
+      if (/presentation|q&a|interview/i.test(e.title || ''))
+        work.push({ ref: `pres:${e.id}`, kind: 'presrev', title: `Revise for ${name}`, what: 'Presentation tomorrow', minutes: rules.presRevMin, day: addDays(due.date, -1) });
     } else if (e.kind === 'lab') {
       const d = addDays(due.date, -1);
       work.push({ ref: `lab:${e.id}`, kind: 'labrev', title: `Revise for ${name}`, what: 'Graded lab tomorrow', minutes: rules.labReviewMin, day: d });
@@ -492,15 +496,20 @@ export function planDay(input) {
     const c = cands[0];
     return book(c.s, c.st, minutes, block);
   }
-  const stretchEvening = () => { if (evening.end < hardBedAbs) { evening.end = hardBedAbs; if (!stays.includes(evening)) stays.push(evening); return true; } return false; };
+  // a long day can run later, down to the 6 h minimum — keeping 20 min free for the evening shake before bed
+  let stretched = false;
+  const stretchEvening = () => { const to = hardBedAbs - (stretched === 'shake' ? 0 : rules.eatMin); if (evening.end < to) { evening.end = to; stretched = true; if (!stays.includes(evening)) stays.push(evening); return true; } return false; };
 
   /** Study `total` minutes in free time: the biggest pieces that fit (2 h max, 30 min min), stretching the evening only when nothing else is left. */
   function placeStudy(total, blk, opts = {}) {
     let left = total, n = 0, stretched = false;
     while (left > 0) {
       let got = null;
-      for (let size = Math.min(rules.studyChunkMax, left); size >= Math.min(30, left) && !got; size -= 15)
+      // one session if it fits; otherwise the biggest piece that leaves no scrap under 30 min
+      for (let size = Math.min(rules.studyChunkMax, left); size >= Math.min(30, left) && !got; size -= 15) {
+        if (left - size > 0 && left - size < 30) continue;
         got = place(size, opts, { ...blk, ref: `${blk.ref}${n ? ':' + n : ''}` });
+      }
       if (got) { left -= got.end - got.start; n++; continue; }
       if (stretched || !opts.mayStretch || !stretchEvening()) break;
       stretched = true;
@@ -522,10 +531,6 @@ export function planDay(input) {
     const keep = b => { b.meal_obj = m; mealBlocks[m.key] = b; return b; };
     let b = at(o);
     if (b) return keep(b);
-    // no free time at the right time: eat it during a study block (at the desk, or from the cooler)
-    const lo = o.earliest ?? -Infinity, hi = o.latest ?? Infinity;
-    const sb = blocks.filter(x => x.type === 'study' && x.end - x.start >= rules.eatMin && x.end > lo && x.start < hi).sort((x, y) => Math.abs(x.start - (o.target ?? x.start)) - Math.abs(y.start - (o.target ?? y.start)))[0];
-    if (sb) { const st = Math.max(sb.start, Math.min(lo, sb.end - rules.eatMin)); const x = { ...blk, title: `${m.name} (while studying)`, start: st, end: st + rules.eatMin, loc: sb.loc, overlap: true }; blocks.push(x); return keep(x); }
     b = at({ ...o, latest: Infinity });
     if (b) return keep(b);
     return null;
@@ -541,22 +546,6 @@ export function planDay(input) {
     const b = eat(m, { earliest: e, target: e, latest: e + 150 });
     if (b) last = b.end; else warnings.push('Breakfast didn’t fit this morning.');
   }
-  // 1. uni work — fixed-day items first, then the rest, each where he prefers it (home first)
-  const sortedWork = work.sort((a, b) => (a.day ? 0 : 1) - (b.day ? 0 : 1) || (a.latest ?? 9999) - (b.latest ?? 9999));
-  const carry = [];
-  for (const w of sortedWork) {
-    const blk = { type: 'study', title: w.title, detail: w.what, ref: w.ref, check: true, kind: w.kind };
-    let got = place(w.minutes, { earliest: w.earliest ?? -Infinity, latest: w.latest ?? Infinity, target: w.at ?? null }, blk);
-    if (!got && w.split) got = placeStudy(w.minutes, blk, { mayStretch: true }) === w.minutes;
-    const dueLater = w.until && w.until.date > date;      // can wait a day rather than cost sleep
-    if (!got && !dueLater && stretchEvening()) got = place(w.minutes, { earliest: w.earliest ?? -Infinity, latest: w.latest ?? Infinity }, blk);
-    if (!got) { if (w.until && w.until.date > date) carry.push(w.ref); else warnings.push(`No time today for ${w.title}${w.until ? ` (due ${t12(w.until.min)})` : ''}.`); }
-  }
-  if (exam) {
-    const did = placeStudy(exam.minutes, { type: 'study', title: exam.title, detail: `${exam.minutes / 60} h today`, ref: `exam:${date}`, check: true, kind: 'exam' }, { mayStretch: true });
-    if (did < exam.minutes) warnings.push(`Only ${Math.round(did / 6) / 10} of ${exam.minutes / 60} h of exam study fit today.`);
-  }
-
   // 2. the rest of the meals
   if (gymV && gymDrive && !skip('preworkout')) {
     const leave = gymDrive.start;
@@ -575,7 +564,24 @@ export function planDay(input) {
     if (!b && stretchEvening()) b = eat(M.dinner, { earliest: e, target: e });
     if (b) last = b.end; else warnings.push('Dinner didn’t fit today.');
   }
+  // uni work and exam study go in the time the meals leave (meals are never eaten while studying)
+  const sortedWork = work.sort((a, b) => (a.day ? 0 : 1) - (b.day ? 0 : 1) || (a.latest ?? 9999) - (b.latest ?? 9999));
+  const carry = [];
+  for (const w of sortedWork) {
+    const blk = { type: 'study', title: w.title, detail: w.what, ref: w.ref, check: true, kind: w.kind };
+    let got = place(w.minutes, { earliest: w.earliest ?? -Infinity, latest: w.latest ?? Infinity, target: w.at ?? null }, blk);
+    if (!got && w.split) got = placeStudy(w.minutes, blk, { mayStretch: true }) === w.minutes;
+    const dueLater = w.until && w.until.date > date;      // can wait a day rather than cost sleep
+    if (!got && !dueLater && stretchEvening()) got = place(w.minutes, { earliest: w.earliest ?? -Infinity, latest: w.latest ?? Infinity }, blk);
+    if (!got) { if (w.until && w.until.date > date) carry.push(w.ref); else warnings.push(`No time today for ${w.title}${w.until ? ` (due ${t12(w.until.min)})` : ''}.`); }
+  }
+  if (exam) {
+    const did = placeStudy(exam.minutes, { type: 'study', title: exam.title, detail: `${exam.minutes / 60} h today`, ref: `exam:${date}`, check: true, kind: 'exam' }, { mayStretch: true });
+    if (did < exam.minutes) warnings.push(`Only ${Math.round(did / 6) / 10} of ${exam.minutes / 60} h of exam study fit today.`);
+  }
+
   if (!skip('evening')) {
+    if (stretched === true) { stretched = 'shake'; evening.end = Math.min(hardBedAbs, evening.end + rules.eatMin); }
     const lastAtHome = Math.max(evening.start, ...booked.filter(k => k.stay === evening).map(k => k.end));
     const shakeAt = Math.max(lastAtHome, Math.min(evening.end, bedPrefAbs) - rules.eatMin);
     let b = eat(M.evening, { earliest: Math.max(evening.start, last != null ? last + 60 : -Infinity), target: shakeAt, latest: evening.end });
@@ -671,6 +677,8 @@ export function planDay(input) {
   }
   blocks.push({ type: 'sleep', start: bedAbs, end: bedAbs, loc: 'home', title: 'Sleep', detail: sleepAfter != null ? `${Math.floor(sleepAfter / 60)} h${sleepAfter % 60 ? ' ' + (sleepAfter % 60) + ' min' : ''} until ${t12(nextWake)}` : '', check: false });
 
+  const pre = blocks.find(b => b.type === 'meal' && b.meal === 'preworkout'), gb = blocks.find(b => b.type === 'gym');
+  if (pre && gb && bedAbs - gb.start < rules.stimFreeH * 60) { pre.supplements = ['Non-stim pre-workout (no caffeine) — the gym is less than 4 h before bed']; pre.nonStim = true; }
   const ORDER = { wake: 0, cook: 1, maid: 2 };
   blocks.sort((a, b) => a.start - b.start || (ORDER[a.type] ?? 5) - (ORDER[b.type] ?? 5) || (a.type === 'drive' ? -1 : 1));
   for (const b of blocks) { b.from_ = b.start; b.startT = hhmm(b.start); b.endT = hhmm(b.end); }
