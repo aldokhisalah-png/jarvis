@@ -19,6 +19,7 @@
 
 export const RULES = {
   classEarly: 10,          // at uni this many minutes before class (includes parking)
+  walkOutMin: 5,           // from class back to the car
   taskMin: 30,             // quiz / assignment / pre-lab / homework
   openFallbackH: 48,       // no "opens" date in Uni Planner → assume it opened this long before the deadline
   labReviewMin: 30,        // revision the day before a graded lab
@@ -272,13 +273,14 @@ function route(visits, startLoc, startMin, drive, ctx) {
     const arriveBy = v.start - early;
     // a long gap: go home (≥ 90 min there) or to grandma's (gap ≥ 2 h, ≥ 1 h there, a uni break) in between
     let via = null;
-    for (const mid of ['home', 'grandma']) {
-      if (mid === loc || mid === v.loc || !ctx.known.has(mid) || isGym(loc) && v.loc === 'uni' && false) continue;
-      if (mid === 'grandma' && !(loc === 'uni' && v.loc === 'uni')) continue;   // grandma's is for breaks between classes
+    // grandma's (15 min from uni) for a ~2–3 h break between classes; otherwise home if it gives an hour there
+    const gap = arriveBy - t, classBreak = loc === 'uni' && v.loc === 'uni';
+    for (const mid of classBreak && gap >= 120 && gap <= 180 ? ['grandma', 'home'] : ['home']) {
+      if (mid === loc || mid === v.loc || !ctx.known.has(mid)) continue;
       const a = drive(loc, mid, t), b = drive(mid, v.loc, arriveBy);
       if (a == null || b == null) continue;
       const there = arriveBy - b - (t + a);
-      if (mid === 'home' ? there >= 90 : there >= 60 && arriveBy - t >= 120) { via = { mid, a, b }; break; }
+      if (there >= 60) { via = { mid, a, b }; break; }
     }
     if (via) {
       items.push({ kind: 'drive', from: loc, to: via.mid, start: t, end: t + via.a });
@@ -304,7 +306,7 @@ function route(visits, startLoc, startMin, drive, ctx) {
       }
     }
     items.push({ kind: 'visit', ...v });
-    loc = v.loc; t = v.end;
+    loc = v.loc; t = v.end + (v.loc === 'uni' && (v.type === 'class' || v.type === 'exam') ? ctx.rules.walkOutMin : 0);   // walk back to the car
   }
   if (loc !== 'home') {                                       // home for the night
     const d = drive(loc, 'home', t);
