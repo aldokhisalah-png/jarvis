@@ -106,3 +106,32 @@ dialog#sheet::backdrop{background:rgba(0,0,0,.6)}
 .login input{background:var(--surface);border:1px solid var(--line-2);border-radius:12px;padding:12px 14px}
 .empty{text-align:center;color:var(--muted)}.empty .btn{margin-top:10px}
 @media (min-width:760px){.blk{grid-template-columns:110px 20px 1fr 36px}}
+
+/* calendar */
+.wchip{flex:none;padding:7px 12px;border-radius:999px;border:1px solid var(--line);color:var(--ink-2);font-size:12.5px;white-space:nowrap}
+.wchip.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.card.day{cursor:pointer;padding:12px 14px}
+.card.day.is-today{border-color:rgba(142,197,255,.35)}
+.dh{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 10px;margin-bottom:6px}
+.dh .dim{margin-left:auto}
+.dim{color:var(--muted);font-size:12px}
+.sum{list-style:none;margin:0;padding:0;display:grid;gap:4px}
+.sum li{font-size:13px;color:var(--ink-2);padding-left:12px;position:relative;line-height:1.4}
+.sum li:before{content:"";position:absolute;left:0;top:7px;width:5px;height:5px;border-radius:50%;background:var(--faint)}
+.sum li b{color:var(--ink);font-weight:500}
+.sum .k-uni:before{background:var(--uni)} .sum .k-exam:before{background:var(--alert)} .sum .k-home:before{background:var(--uni)}
+.sum .k-gym:before{background:var(--gym)} .sum .k-food:before{background:var(--food)} .sum .k-walk:before{background:var(--walk)} .sum .k-drive:before{background:var(--jarvis)}
+.sum .k-warn{color:var(--alert)} .sum .k-warn:before{background:var(--alert)}
+.sum .k-exam b{color:var(--alert)}
+
+/* settings: rules */
+h3{font-size:12px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin:18px 0 4px}
+.rules li{align-items:center}
+.rules li > span:first-child{flex:1;min-width:0}
+.rv{display:flex;align-items:center;gap:4px;flex:none}
+.rnum{display:inline-flex;align-items:center;gap:5px}
+.rin{background:var(--surface);border:1px solid var(--line-2);border-radius:10px;padding:6px 8px;color:var(--ink);width:78px;font-variant-numeric:tabular-nums}
+select.rin{width:auto}
+input[type=time].rin{width:auto}
+.rules li.chg .rin{border-color:rgba(142,197,255,.6)}
+.rules li:not(:has(.rv)){color:var(--ink-2)}

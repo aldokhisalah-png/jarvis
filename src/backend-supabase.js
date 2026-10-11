@@ -28,6 +28,26 @@ function supabaseBackend(cfg) {
       return (r || []).filter(m => (m.kind === 'day' && m.date >= from) || (m.kind === 'rule' && m.category === 'standing'));
     },
     async settings() { const r = await one(sb.from('day_settings').select('places,prefs').eq('user_id', uid).maybeSingle()); return { places: {}, prefs: {}, ...(r || {}) }; },
+    /** Everything the Calendar tab needs to plan the term in the browser (his apps are only read). */
+    async termData() {
+      const t = localOf(new Date().toISOString()).date;
+      const [classes, events, ppl, nut, st, mem, plans] = await Promise.all([
+        one(sb.from('planner_classes').select('course,kind,weekday,start_time,end_time,room').eq('user_id', uid)),
+        one(sb.from('planner_events').select('id,course,title,kind,due_at,all_day,weight,note,done').eq('user_id', uid).gte('due_at', new Date(Date.now() - 5 * 864e5).toISOString())),
+        one(sb.from('ppl_records').select('kind,key,body').eq('user_id', uid)),
+        one(sb.from('nutrition_records').select('kind,id,body').eq('user_id', uid).eq('deleted', false).eq('kind', 'plan_version')),
+        one(sb.from('day_settings').select('places,prefs,travel').eq('user_id', uid).maybeSingle()),
+        one(sb.from('jarvis_memory').select('id,kind,date,overrides,created_at').eq('user_id', uid).eq('active', true).eq('kind', 'day').gte('date', addDays(t, -1)).order('created_at')),
+        one(sb.from('day_plans').select('date,plan').eq('user_id', uid).gte('date', addDays(t, -14)).order('date'))
+      ]);
+      return { classes: classes || [], events: events || [], ppl: ppl || [], nut: nut || [], settings: st || { places: {}, prefs: {}, travel: {} }, dayChanges: mem || [], plans: (plans || []).filter(p => p.plan && p.plan.version === 2) };
+    },
+    async setRule(key, value) {
+      const cur = await one(sb.from('day_settings').select('prefs').eq('user_id', uid).maybeSingle()) || { prefs: {} };
+      const rules = { ...((cur.prefs || {}).rules || {}) };
+      if (value == null) delete rules[key]; else rules[key] = value;
+      await one(sb.from('day_settings').update({ prefs: { ...(cur.prefs || {}), rules }, updated_at: new Date().toISOString() }).eq('user_id', uid));
+    },
     async messages(n = 20) { const r = await one(sb.from('jarvis_messages').select('role,body,created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(n)); return (r || []).reverse(); },
     async pushStatus() {
       const s = { supported: 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window, subscribed: false, perm: 'default' };

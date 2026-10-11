@@ -26,7 +26,7 @@ All the numbers are in Settings → Your rules, and change when you tell Jarvis.
 | Path | What |
 |---|---|
 | `src/scheduler.js` | The rules. Same file runs in the app and the backend (`scripts/sync-function.sh` copies it). |
-| `src/app.js`, `styles/app.css`, `index.html` | The app: Today · Week · Tell · Settings |
+| `src/app.js`, `styles/app.css`, `index.html` | The app: **Today** (hour by hour, checkmarks) · **Calendar** (the whole term, planned in the browser with the same rules) · **Jarvis** (tell it changes) · **Settings** (places, notifications, every rule — numbers editable) |
 | `src/backend-supabase.js` | Supabase connection (same project and sign-in as the other apps) |
 | `supabase/functions/jarvis/` | Edge Function: planning, Claude, Google traffic, notifications (pg_cron calls it every minute) |
 | `test/run-real.mjs` | Print a week of plans from a saved copy of real data |

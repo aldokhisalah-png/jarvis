@@ -760,3 +760,74 @@ export function planDays(input) {
   }
   return { days: out };
 }
+
+// =====================================================================
+// CALENDAR — what's on each date (for the Calendar tab), and his rules in plain words (for Settings)
+// =====================================================================
+const KIND_LABEL = { lab: 'Graded lab', gca: 'GCA', quiz: 'Quiz', assignment: 'Assignment', prelab: 'Pre-lab', hw: 'Homework', project: 'Project', exam: 'Exam' };
+/** Assessments held during a class or lab session, and at-home work that opens, by date. */
+export function calendarItems(events = [], classes = [], rules = RULES) {
+  const inClass = {}, opens = {}, exams = {};
+  for (const e of events) {
+    if (e.done || ['info', 'academic', 'prelab'].includes(e.kind)) continue;
+    const l = localOf(e.due_at);
+    if (e.kind === 'exam') { (exams[l.date] = exams[l.date] || []).push(e.course); continue; }
+    const c = classes.find(c => c.course === e.course && +c.weekday === dowOf(l.date) && toMin(c.start_time) <= l.min && l.min < toMin(c.end_time));
+    if (c && !/moodle/i.test(e.title || '')) (inClass[l.date] = inClass[l.date] || []).push({ at: l.min, course: e.course, title: e.title, weight: e.weight || null, room: c.room || null, kind: e.kind });
+  }
+  for (const w of uniWork(events, rules).filter(w => w.from)) {
+    const course = (w.title.match(/^(\S+ \S+)/) || [])[1] || '', title = w.title.slice(course.length + 1);
+    const ev = events.find(e => `${e.course} ${e.title}` === w.title);
+    (opens[w.from.date] = opens[w.from.date] || []).push({ at: w.from.min, course, title, weight: ev && ev.weight || null, due: w.until, assumed: w.opensGuessed });
+  }
+  for (const k of Object.keys(inClass)) inClass[k].sort((a, b) => a.at - b.at);
+  return { inClass, opens, exams };
+}
+
+/** Every rule, grouped, in plain words. `key` = an editable number in RULES; `fmt` how to show/edit it. */
+export const RULE_TEXT = [
+  { group: 'Classes', items: [
+    { text: 'You go to every class. Jarvis gets you there this many minutes early, to park and walk in', key: 'classEarly', fmt: 'min' },
+    { text: 'Walk from class back to the car', key: 'walkOutMin', fmt: 'min' },
+    { text: 'No classes during breaks or after classes end (from Uni Planner)' },
+    { text: 'A 2–3 h gap between classes is spent at your grandmother’s; a longer one at home' } ] },
+  { group: 'Uni work', items: [
+    { text: 'Quiz, assignment, pre-lab, homework or project: one session on the day it opens', key: 'taskMin', fmt: 'min' },
+    { text: 'No opening date: assume it opened this long before the deadline', key: 'openFallbackH', fmt: 'h' },
+    { text: 'Pre-labs open 24 h before the lab (submit within 24 h)' },
+    { text: 'Graded lab: revision the day before', key: 'labReviewMin', fmt: 'min' },
+    { text: 'Presentation, project Q&A or interview: revision the day before', key: 'presRevMin', fmt: 'min' },
+    { text: 'GCA: study session', key: 'gcaStudyMin', fmt: 'min' },
+    { text: 'GCA: study this many days before', key: 'gcaDaysBefore', fmt: 'days' },
+    { text: 'Exams are assumed on the first day of exam week until the schedule is out' },
+    { text: 'Exam study starts this many days before exam week', key: 'examStartDays', fmt: 'days' },
+    { text: 'Exam study per day', key: 'examDailyMin', fmt: 'min' },
+    { text: 'Exam study per day in the last week', key: 'examFinalWeekMin', fmt: 'min' },
+    { text: 'Study is one long session where it fits; split only when no gap is big enough' } ] },
+  { group: 'Gym', items: [
+    { text: 'Every day unless you tell Jarvis no' },
+    { text: 'Branch closest to where you are or go next — uni → Mahboula, home → Rigae, grandmother’s → Sabah Al-Salem; Rigae on a tie' },
+    { text: 'Never Oxygen Sabah Al-Salem 5–9am or 11am–3pm' },
+    { text: 'Best 10pm–4am (quiet) · fine 4am–4pm · busy 9–10pm · packed 4–9pm' },
+    { text: 'Workout length from PPL Coach; shower at the gym when going gym → uni', key: 'showerMin', fmt: 'min' },
+    { text: 'Uni → gym: bring headphones. Gym → uni: bring a gym bag' },
+    { text: 'Non-stim pre-workout when the gym starts less than this before bed', key: 'stimFreeH', fmt: 'h' } ] },
+  { group: 'Food', items: [
+    { text: 'Meals and amounts from Nutrition Coach; never eaten while studying' },
+    { text: 'The maid cooks from', key: 'maidFrom', fmt: 'time' },
+    { text: 'The maid cooks until', key: 'maidTo', fmt: 'time' },
+    { text: 'Outside her hours you cook; breakfast cooking takes', key: 'cookSelfMin', fmt: 'min' },
+    { text: 'Lunch around', key: 'lunchAt', fmt: 'time' },
+    { text: 'Dinner around', key: 'dinnerAt', fmt: 'time' },
+    { text: 'Eating takes', key: 'eatMin', fmt: 'min' },
+    { text: 'No fridge: cooked the same day; a cooler in the car; microwaves at the gyms and the gas station near uni' },
+    { text: 'Text the maid at 8pm the night before (message written for you)' } ] },
+  { group: 'Day', items: [
+    { text: 'Sleep (preferred)', key: 'sleepPrefer', fmt: 'h' },
+    { text: 'Sleep (minimum)', key: 'sleepMin', fmt: 'h' },
+    { text: 'Getting ready in the morning', key: 'readyMin', fmt: 'min' },
+    { text: 'Walking pad at home, during study, meals and relaxing', key: 'walkMin', fmt: 'min' },
+    { text: 'Grocery shopping day', key: 'groceryDow', fmt: 'dow' },
+    { text: 'Grocery shopping takes', key: 'groceryMin', fmt: 'min' },
+    { text: 'When time is short: uni → gym → food → sleep' } ] }
+];
