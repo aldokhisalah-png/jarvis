@@ -218,6 +218,22 @@ export function uniWork(events = [], rules = RULES) {
   }
   return work;
 }
+/** Dates with no classes: breaks from Uni Planner ("Winter break (20–31 Dec)") and everything after "Classes end". */
+export function noClassDays(events = []) {
+  const out = { ranges: [], after: null };
+  for (const e of events) {
+    if (e.kind !== 'academic') continue;
+    const start = localOf(e.due_at).date;
+    if (/classes end/i.test(e.title || '')) out.after = start;
+    else if (/break/i.test(e.title || '')) {
+      const m = (e.title || '').match(/(\d{1,2})\s*[–-]\s*(\d{1,2})\s*([A-Za-z]{3})/);
+      let a = start, b = start;
+      if (m) { const mi = MON.findIndex(x => x.toLowerCase() === m[3].toLowerCase()); let y = +start.slice(0, 4); if (mi + 1 < +start.slice(5, 7)) y++; a = `${y}-${pad(mi + 1)}-${pad(+m[1])}`; b = `${y}-${pad(mi + 1)}-${pad(+m[2])}`; }
+      out.ranges.push([a, b]);
+    }
+  }
+  return d => (out.after && d > out.after) || out.ranges.some(([a, b]) => d >= a && d <= b);
+}
 export function examStudyFor(date, weeks, rules = RULES) {
   let mins = 0, which = null;
   for (const w of weeks) {
@@ -310,9 +326,13 @@ function chooseGym(base, ctx) {
       const a = drive(prevLoc, g, s), b = drive(g, nextLoc, s + W);
       if (a == null || b == null) continue;
       const gv = { loc: g, start: s, end: s + W + shower, type: 'gym', shower: !!shower };
-      const visits = [...ctx.visits, gv].sort((x, y) => x.start - y.start);
-      const r = route(visits, ctx.startLoc, ctx.startMin, drive, ctx);
+      let visits = [...ctx.visits, gv].sort((x, y) => x.start - y.start);
+      let r = route(visits, ctx.startLoc, ctx.startMin, drive, ctx);
       if (!r.ok) continue;
+      if (gv.shower) {                         // he goes home in between: he showers there, not at the gym
+        const out = r.items.find(i => i.kind === 'drive' && i.from === g && i.start >= gv.start);
+        if (out && out.to !== 'uni') { gv.end -= rules.showerMin; gv.shower = false; visits = [...ctx.visits, gv].sort((x, y) => x.start - y.start); r = route(visits, ctx.startLoc, ctx.startMin, drive, ctx); if (!r.ok) continue; }
+      }
       const firstLeave = ctx.morning ? (r.items.find(i => i.kind === 'drive' && i.from === ctx.startLoc) || {}).start : null;
       const wake = ctx.morning && firstLeave != null ? Math.min(ctx.latestWake, ctx.wakeBefore(firstLeave)) : ctx.latestWake;
       // only the sleep the gym itself takes away counts
@@ -328,7 +348,8 @@ function chooseGym(base, ctx) {
       // free time left for everything else must still cover uni work + meals
       const free = r.items.filter(i => i.kind === 'stay' && !i.buffer && !isGym(i.loc)).reduce((n, i) => n + i.end - i.start, 0) + Math.max(0, hardBed - r.homeAt);
       if (free < ctx.needFree) continue;
-      const score = [sleep >= rules.sleepPrefer ? 0 : 1, tier, trip, s];
+      const tooSoon = ctx.morning && s < ctx.latestWake + 120 ? 1 : 0;   // leaves room between breakfast and pre-workout
+      const score = [sleep >= rules.sleepPrefer ? 0 : 1, tier, tooSoon, trip, s];
       if (!best || lexLess(score, best.score))
         best = { score, visit: gv, route: r, tier, gym: g, prevLoc: gin ? gin.from : prevLoc, nextLoc: gout ? gout.to : nextLoc, sleep };
     }
@@ -351,7 +372,8 @@ export function planDay(input) {
 
   // ---- fixed visits: classes (unless cancelled), exams, things he told Jarvis about
   const cancelled = change.cancelClasses === true ? null : new Set(change.cancelClasses || []);
-  const classes = (input.classes || []).filter(c => +c.weekday === dow && !(cancelled === null || cancelled.has(c.course)))
+  const offDay = input.noClass ? input.noClass(date) : false;
+  const classes = (input.classes || []).filter(c => !offDay && +c.weekday === dow && !(cancelled === null || cancelled.has(c.course)))
     .map(c => ({ start: toMin(c.start_time), end: toMin(c.end_time), loc: 'uni', type: 'class', title: `${c.course} ${c.kind || ''}`.trim(), room: c.room || null, course: c.course }));
   let visits = [...classes, ...examsOn(date, input.events, rules),
     ...(change.busy || []).map(b => ({ start: toMin(b.from), end: toMin(b.to), loc: known.has(b.place) ? b.place : 'other', type: 'busy', title: b.title || 'Busy' }))]
@@ -662,8 +684,9 @@ export function maidMessage(jobs, cookDay, sentDayBefore = false) {
  */
 export function planDays(input) {
   const rules = { ...RULES, ...(input.rules || {}) };
-  const weeks = examWeeks(input.events || []);
-  const work = uniWork(input.events || [], rules);
+  const weeks = input.noStudy ? [] : examWeeks(input.events || []);
+  const noClass = noClassDays(input.events || []);
+  const work = input.noStudy ? [] : uniWork(input.events || [], rules);
   const out = [];
   let prevBedAbs = input.prevBedAbs ?? null;
   const done = new Set(input.doneRefs || []);
@@ -673,7 +696,7 @@ export function planDays(input) {
     const ch = (input.changes || {})[date] || {};
     if (ch.wakeAt) return toMin(ch.wakeAt);
     const cancelled = ch.cancelClasses === true ? null : new Set(ch.cancelClasses || []);
-    const vs = [...(input.classes || []).filter(c => +c.weekday === dowOf(date) && !(cancelled === null || cancelled.has(c.course))).map(c => ({ start: toMin(c.start_time), loc: 'uni', cls: true })),
+    const vs = [...(input.classes || []).filter(c => !noClass(date) && +c.weekday === dowOf(date) && !(cancelled === null || cancelled.has(c.course))).map(c => ({ start: toMin(c.start_time), loc: 'uni', cls: true })),
       ...examsOn(date, input.events, rules).map(e => ({ start: e.start, loc: 'uni', cls: true })),
       ...(ch.busy || []).map(b => ({ start: toMin(b.from), loc: b.place || 'other' }))].filter(v => v.start != null).sort((a, b) => a.start - b.start);
     if (!vs.length) return null;
@@ -685,7 +708,7 @@ export function planDays(input) {
   for (let i = 0; i < (input.n || 1); i++) {
     const date = addDays(input.from, i);
     const wn = firstNeed(addDays(date, 1));
-    const plan = planDay({ ...input, rules, date, work, drive: driveOf(date), examWeeks: weeks, doneRefs: done, change: (input.changes || {})[date] || {},
+    const plan = planDay({ ...input, rules, date, work, noClass, drive: driveOf(date), examWeeks: weeks, doneRefs: done, change: (input.changes || {})[date] || {},
       start: i === 0 ? input.firstStart : null, walkDone: i === 0 ? input.firstWalkDone || 0 : 0, prevBedAbs, wakeNextAbs: wn != null ? wn + 1440 : null });
     for (const b of plan.blocks) if (b.ref && b.type === 'study') done.add(b.ref);
     out.push(plan);
