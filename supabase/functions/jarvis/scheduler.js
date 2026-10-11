@@ -274,7 +274,7 @@ function route(visits, startLoc, startMin, drive, ctx) {
     let via = null;
     for (const mid of ['home', 'grandma']) {
       if (mid === loc || mid === v.loc || !ctx.known.has(mid) || isGym(loc) && v.loc === 'uni' && false) continue;
-      if (mid === 'grandma' && !(loc === 'uni' || v.loc === 'uni')) continue;
+      if (mid === 'grandma' && !(loc === 'uni' && v.loc === 'uni')) continue;   // grandma's is for breaks between classes
       const a = drive(loc, mid, t), b = drive(mid, v.loc, arriveBy);
       if (a == null || b == null) continue;
       const there = arriveBy - b - (t + a);
