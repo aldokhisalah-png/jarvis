@@ -43,7 +43,7 @@ const t = r.days[0];
 console.log(`saved ${tables.day_plans.length} days; today ${t.date}: ${t.blocks.length} blocks, gym=${JSON.stringify(t.gym)} (expected none: "No gym today"), notes=${t.notes}`);
 if (t.gym) throw new Error('day change ignored');
 // 2. mid-day re-plan from a GPS fix at uni
-const r2 = await replan(sb, 'u', { coords: { lat: 29.1669, lng: 48.1005 } });
+const r2 = await replan(sb, 'u', { coords: { lat: 29.1625, lng: 48.09896 } });
 console.log(`re-plan: where=${JSON.stringify({ loc: r2.loc, how: r2.how })}, blocks=${r2.days[0].blocks.length}`);
 // 3. the week ahead is sane: every day has a sleep block and no overlapping drives
 for (const d of r2.days) {

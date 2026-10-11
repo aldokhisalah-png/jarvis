@@ -58,7 +58,7 @@ async function aiJson({ system, user, schema, maxTokens = 3000 }: any, attempt =
     headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
     body: JSON.stringify({ model: MODEL, max_tokens: maxTokens,
       system: `${system}\n\nAnswer by calling the "answer" tool exactly once, with every required field. Do not reply in plain text.`,
-      messages: [{ role: 'user', content: user }], tools: [{ name: 'answer', description: 'Your answer.', input_schema: schema }], tool_choice: { type: 'any' } })
+      messages: [{ role: 'user', content: user }], tools: [{ name: 'answer', description: 'Your answer.', input_schema: schema }], tool_choice: { type: 'auto' } })
   });
   const j = await r.json();
   if (!r.ok) throw new Error(`Claude request failed (${r.status}): ${j?.error?.message || 'unknown error'}`);
@@ -199,7 +199,7 @@ async function whereAmI(sb: any, uid: string, settings: any, coords: any) {
   if (!coords || !isFinite(+coords.lat) || !known.length) return null;
   let best: string | null = null, bd = Infinity;
   for (const k of known) { const d = dist(coords, places[k]); if (d < bd) { bd = d; best = k; } }
-  if (best && bd <= 400) return { loc: best, profile: {} };
+  if (best && bd <= (best === 'uni' ? 800 : 400)) return { loc: best, profile: {} };
   const profile: any = {};
   try {
     if (canSpend(settings, 'matrix', known.length)) {
@@ -244,7 +244,10 @@ async function replan(sb: any, uid: string, opts: { coords?: any, reason?: strin
   // where he is
   let here: any = null, loc = 'home', how = '';
   const fix = st.prefs.lastFix, fresh = fix && Date.now() - Date.parse(fix.at) < 15 * 60000 ? fix : null;
-  if (fresh) { here = await whereAmI(sb, uid, st, fresh); if (here) { loc = here.loc; how = loc === 'here' ? 'your live location' : `you’re at ${S.PLACE_NAME[loc]}`; } }
+  const inClassNow = D.classes.some((c: any) => +c.weekday === S.dowOf(today) && S.toMin(c.start_time)! <= now.min && S.toMin(c.end_time)! > now.min)
+    && !(mergeChanges(D.dayChanges)[today] || {}).cancelClasses;
+  if (inClassNow) { loc = 'uni'; how = 'in class'; }                     // his rule: during class time he's at uni
+  else if (fresh) { here = await whereAmI(sb, uid, st, fresh); if (here) { loc = here.loc; how = loc === 'here' ? 'your live location' : `you’re at ${S.PLACE_NAME[loc]}`; } }
   if (!here) { const p = placeNow(todayPlan, now, D.classes, today); loc = p.loc; how = p.how; }
 
   const started = todayPlan && !opts.fresh && todayPlan.wake != null && now.min >= todayPlan.wake;
